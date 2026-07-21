@@ -1,0 +1,58 @@
+{
+  "name": "business-central-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Dynamics 365 Business Central — query and manage ERP data via the standard v2.0 and custom AL APIs",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "business-central-mcp-server": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "license": "MIT",
+  "author": "Victor Perez",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/user-vik/business-central-mcp-server.git"
+  },
+  "files": [
+    "index.js",
+    "package.json",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "business-central",
+    "dynamics-365",
+    "erp",
+    "odata",
+    "claude",
+    "anthropic"
+  ],
+  "dependencies": {
+    "@azure/identity": "^4.5.0",
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.15.0",
+    "eslint": "^9.15.0",
+    "eslint-config-prettier": "^9.1.0",
+    "globals": "^15.12.0",
+    "prettier": "^3.3.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

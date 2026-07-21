@@ -1,0 +1,831 @@
+#!/usr/bin/env node
+import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  AzureCliCredential,
+  AzurePowerShellCredential,
+  ClientSecretCredential,
+  DefaultAzureCredential,
+  DeviceCodeCredential,
+  InteractiveBrowserCredential,
+  ManagedIdentityCredential,
+} from "@azure/identity";
+import { z } from "zod";
+
+// Single source of truth for the server's version — keeps `package.json`
+// and the MCP server identity in sync without manual edits.
+const PACKAGE = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+const VERSION = PACKAGE.version;
+
+const AUTH_MODES = [
+  "interactive",
+  "device-code",
+  "cli",
+  "azure-powershell",
+  "service-principal",
+  "managed-identity",
+  "default",
+];
+// Public Azure CLI client ID — safe default for user-flow modes only.
+const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+
+function requireEnv(value, name, mode) {
+  if (!value) {
+    console.error(`BC_AUTH_MODE=${mode} requires ${name}`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function buildCredential() {
+  const mode = (process.env.BC_AUTH_MODE || "interactive").toLowerCase();
+  if (!AUTH_MODES.includes(mode)) {
+    console.error(`Invalid BC_AUTH_MODE "${mode}". Valid: ${AUTH_MODES.join(", ")}`);
+    process.exit(1);
+  }
+  const tenantId = process.env.AZURE_TENANT_ID;
+  const clientId = process.env.AZURE_CLIENT_ID;
+  const clientSecret = process.env.AZURE_CLIENT_SECRET;
+
+  switch (mode) {
+    case "interactive":
+      return new InteractiveBrowserCredential({
+        tenantId: requireEnv(tenantId, "AZURE_TENANT_ID", mode),
+        clientId: clientId || AZURE_CLI_CLIENT_ID,
+      });
+    case "device-code":
+      return new DeviceCodeCredential({
+        tenantId: requireEnv(tenantId, "AZURE_TENANT_ID", mode),
+        clientId: clientId || AZURE_CLI_CLIENT_ID,
+        // Default callback writes to stdout, which would corrupt the MCP
+        // protocol stream. Redirect to stderr so the MCP client logs it.
+        userPromptCallback: (info) => {
+          console.error(`[bc-mcp] ${info.message}`);
+        },
+      });
+    case "cli":
+      return new AzureCliCredential(tenantId ? { tenantId } : undefined);
+    case "azure-powershell":
+      return new AzurePowerShellCredential(tenantId ? { tenantId } : undefined);
+    case "service-principal":
+      return new ClientSecretCredential(
+        requireEnv(tenantId, "AZURE_TENANT_ID", mode),
+        requireEnv(clientId, "AZURE_CLIENT_ID", mode),
+        requireEnv(clientSecret, "AZURE_CLIENT_SECRET", mode),
+      );
+    case "managed-identity":
+      return new ManagedIdentityCredential(clientId ? { clientId } : undefined);
+    case "default":
+      return new DefaultAzureCredential(tenantId ? { tenantId } : undefined);
+  }
+}
+
+const credential = buildCredential();
+
+// Business Central Online. One host serves everything: the environment
+// discovery API at /environments/v1.1 and the per-environment data plane at
+// /v2.0/{environment}/api/{route}/... . Token audience is the same host.
+const SCOPE = process.env.BC_SCOPE || "https://api.businesscentral.dynamics.com/.default";
+const BC_BASE = process.env.BC_API_BASE || "https://api.businesscentral.dynamics.com";
+const DEFAULT_ENVIRONMENT = process.env.BC_DEFAULT_ENVIRONMENT || null;
+const DEFAULT_COMPANY_ID = process.env.BC_DEFAULT_COMPANY_ID || null;
+const MAX_RETRIES = 3;
+const RETRY_MAX_DELAY_MS = 60_000;
+
+async function getToken() {
+  const t = await credential.getToken(SCOPE);
+  return t.token;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Calls a path relative to BC_BASE (e.g. "/v2.0/Production/api/v2.0/companies").
+// `extraQuery` adds query parameters ($filter, $top, ...). `extraHeaders` adds
+// request headers (If-Match for OData optimistic concurrency on PATCH/DELETE).
+// Retries on HTTP 429/503, honoring Retry-After.
+async function bcApi(method, path, body, extraQuery = {}, extraHeaders = {}) {
+  const token = await getToken();
+  const url = new URL(`${BC_BASE}${path}`);
+  for (const [k, v] of Object.entries(extraQuery)) {
+    if (v != null) url.searchParams.set(k, String(v));
+  }
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...extraHeaders,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+      const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
+      const backoffMs = Number.isFinite(retryAfter)
+        ? Math.min(retryAfter * 1000, RETRY_MAX_DELAY_MS)
+        : Math.min(2 ** attempt * 500, RETRY_MAX_DELAY_MS);
+      console.error(
+        `[bc-mcp] ${res.status} throttled on ${method} ${path}; retrying in ${backoffMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})`,
+      );
+      await sleep(backoffMs);
+      continue;
+    }
+    const text = await res.text();
+    if (!res.ok) {
+      const err = new Error(`BusinessCentral ${method} ${path} -> ${res.status}: ${text}`);
+      err.status = res.status;
+      throw err;
+    }
+    return text ? JSON.parse(text) : null;
+  }
+}
+
+// Resolve the target environment for a call, falling back to the configured
+// default. Environment names come from list_environments (e.g. "Production").
+function resolveEnv(environment) {
+  const env = environment || DEFAULT_ENVIRONMENT;
+  if (!env) {
+    throw new Error(
+      "No environment specified and BC_DEFAULT_ENVIRONMENT is not set. Call list_environments to discover valid names, then pass `environment`.",
+    );
+  }
+  return env;
+}
+
+// Resolve the target company, falling back to the configured default.
+// Company ids are GUIDs from list_companies.
+function resolveCompany(company_id) {
+  const id = company_id || DEFAULT_COMPANY_ID;
+  if (!id) {
+    throw new Error(
+      "No company_id specified and BC_DEFAULT_COMPANY_ID is not set. Call list_companies to discover company ids, then pass `company_id`.",
+    );
+  }
+  return id;
+}
+
+// The API route under /api/. Default is Microsoft's standard "v2.0"; custom
+// APIs published from AL extensions live at "{publisher}/{group}/{version}".
+const CUSTOM_ROUTE_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/v[0-9.]+$/;
+function resolveRoute(api_route) {
+  if (!api_route || api_route === "v2.0") return "v2.0";
+  if (!CUSTOM_ROUTE_RE.test(api_route)) {
+    throw new Error(
+      `Invalid api_route "${api_route}". Expected "v2.0" or "{publisher}/{group}/{version}" (e.g. "contoso/sales/v1.0").`,
+    );
+  }
+  return api_route;
+}
+
+// Build the environment-scoped data-plane path prefix.
+function dataPath(env, route, suffix = "") {
+  return `/v2.0/${encodeURIComponent(env)}/api/${route}${suffix}`;
+}
+
+// Build a company-scoped path. Company ids are GUIDs so encodeURIComponent is
+// belt-and-suspenders.
+function companyPath(env, route, companyId, suffix = "") {
+  return dataPath(env, route, `/companies(${encodeURIComponent(companyId)})${suffix}`);
+}
+
+// Entity record path. Record ids in the standard v2.0 API are GUIDs; composite
+// or string keys should be located via query_entities + $filter instead.
+function entityPath(env, route, companyId, entitySet, recordId) {
+  return companyPath(
+    env,
+    route,
+    companyId,
+    `/${encodeURIComponent(entitySet)}(${encodeURIComponent(recordId)})`,
+  );
+}
+
+// GET a resource and return null on 404 instead of throwing. Used by the
+// destructive tools' plan step to detect existence before delete.
+async function fetchExistingOrNull(path) {
+  try {
+    return await bcApi("GET", path);
+  } catch (e) {
+    if (e?.status === 404) return null;
+    throw e;
+  }
+}
+
+function ok(obj) {
+  return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
+}
+
+// Wraps a tool handler so any thrown error is returned as a structured
+// MCP tool error instead of escaping as a protocol-level failure. This lets
+// the LLM see the error message and react to it.
+function safeTool(handler) {
+  return async (args) => {
+    try {
+      return await handler(args);
+    } catch (e) {
+      const message = e?.message ?? String(e);
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  };
+}
+
+const TRUNCATE_CHARS = 24_576;
+
+// Truncate a value when its JSON representation exceeds `max` chars, returning
+// a small envelope describing the truncation. Query results over wide entities
+// (generalLedgerEntries, salesInvoiceLines, ...) can otherwise blow the LLM
+// context window.
+function maybeTruncate(value, max = TRUNCATE_CHARS) {
+  if (value == null) return value;
+  const json = JSON.stringify(value);
+  if (json == null || json.length <= max) return value;
+  return {
+    _truncated: true,
+    _totalChars: json.length,
+    _preview: json.slice(0, max),
+    _hint:
+      "Narrow the query with $select/$filter/top, or pass full=true for the untruncated payload.",
+  };
+}
+
+// Extracts a human-meaningful subject from an Entra access token's middle
+// segment. Returns "unknown" on any parse failure — never throws, since this
+// is only used for audit logging.
+function parseTokenSubject(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return "unknown";
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return (
+      payload.upn ||
+      payload.preferred_username ||
+      payload.unique_name ||
+      payload.appid ||
+      payload.oid ||
+      "unknown"
+    );
+  } catch {
+    return "unknown";
+  }
+}
+
+// Wraps a mutating tool so each invocation is audit-logged to stderr with
+// timestamp, tool name, target resource, caller identity, and outcome.
+// Layered on top of safeTool — errors are still structured for the LLM.
+function writeTool(toolName, getTarget, handler) {
+  return safeTool(async (args) => {
+    const target = getTarget(args);
+    const token = await getToken();
+    const caller = parseTokenSubject(token);
+    const startedAt = new Date().toISOString();
+    console.error(
+      `[bc-mcp][AUDIT] ${startedAt} tool=${toolName} target=${target} caller=${caller} status=ATTEMPT`,
+    );
+    try {
+      const result = await handler(args);
+      console.error(
+        `[bc-mcp][AUDIT] ${new Date().toISOString()} tool=${toolName} target=${target} caller=${caller} status=SUCCESS`,
+      );
+      return result;
+    } catch (e) {
+      const msg = (e?.message ?? String(e)).slice(0, 200);
+      console.error(
+        `[bc-mcp][AUDIT] ${new Date().toISOString()} tool=${toolName} target=${target} caller=${caller} status=FAILURE error=${msg}`,
+      );
+      throw e;
+    }
+  });
+}
+
+const WRITE_ENABLED = (process.env.BC_MCP_MODE ?? "read").toLowerCase() === "write";
+const DESTRUCTIVE_REQUESTED = process.env.BC_MCP_ALLOW_DELETE === "true";
+const DESTRUCTIVE_ENABLED = WRITE_ENABLED && DESTRUCTIVE_REQUESTED;
+if (WRITE_ENABLED) {
+  console.error(
+    "[bc-mcp] write mode enabled — create/update/bound-action tools are exposed. These mutate real ERP data.",
+  );
+}
+if (DESTRUCTIVE_ENABLED) {
+  console.error(
+    "[bc-mcp] destructive mode enabled — delete_entity is exposed (plan/apply confirmation required)",
+  );
+} else if (DESTRUCTIVE_REQUESTED && !WRITE_ENABLED) {
+  console.error(
+    "[bc-mcp] WARNING: BC_MCP_ALLOW_DELETE=true ignored because BC_MCP_MODE is not 'write'.",
+  );
+}
+
+// ─── Plan/apply token store for destructive mutations ───────────────────────
+// Tokens bind a specific (tool, target, payload) to a confirmation call.
+// The plan step returns a token; the apply step (dry_run=false) must echo it
+// back. Tokens expire after PLAN_TTL_MS. Captured @odata.etag enforces
+// optimistic concurrency on the apply via If-Match.
+const PLAN_TTL_MS = 10 * 60 * 1000;
+const PLAN_STORE_MAX = 100;
+const pendingPlans = new Map();
+
+function hashPayload(payload) {
+  return JSON.stringify(payload ?? null);
+}
+
+function createPlanToken(toolName, target, payload, etag) {
+  // Bound the store: evict the oldest entry (Map preserves insertion order)
+  // when at capacity. Prevents a buggy client from exhausting memory before
+  // the periodic sweep runs.
+  if (pendingPlans.size >= PLAN_STORE_MAX) {
+    const oldest = pendingPlans.keys().next().value;
+    if (oldest !== undefined) pendingPlans.delete(oldest);
+  }
+  const token = crypto.randomUUID();
+  const expiresAt = Date.now() + PLAN_TTL_MS;
+  pendingPlans.set(token, {
+    toolName,
+    target,
+    payloadHash: hashPayload(payload),
+    etag,
+    expiresAt,
+  });
+  return { token, expiresAt: new Date(expiresAt).toISOString() };
+}
+
+function consumePlanToken(token, toolName, target, payload) {
+  const entry = pendingPlans.get(token);
+  if (!entry) {
+    throw new Error(
+      `Invalid confirm_token. Tokens expire after ${PLAN_TTL_MS / 60_000}m; request a new plan with dry_run=true.`,
+    );
+  }
+  if (Date.now() > entry.expiresAt) {
+    pendingPlans.delete(token);
+    throw new Error(`confirm_token expired. Request a new plan with dry_run=true.`);
+  }
+  if (
+    entry.toolName !== toolName ||
+    entry.target !== target ||
+    entry.payloadHash !== hashPayload(payload)
+  ) {
+    throw new Error(
+      `confirm_token does not match the current call. If the payload changed since the plan, request a new plan.`,
+    );
+  }
+  pendingPlans.delete(token);
+  return entry;
+}
+
+// Sweep expired plans every minute. .unref() so the timer doesn't keep the
+// Node event loop alive at shutdown.
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of pendingPlans) {
+    if (entry.expiresAt < now) pendingPlans.delete(token);
+  }
+}, 60_000).unref();
+
+// Shared plan/apply executor used by every destructive tool. Splits the call
+// into "compute plan + issue token" (dry_run, default) vs. "consume token +
+// apply with If-Match" (dry_run=false).
+async function executePlanApply({
+  toolName,
+  action,
+  target,
+  payload,
+  dry_run,
+  confirm_token,
+  fetchBefore,
+  buildAfter,
+  apply,
+}) {
+  const isDryRun = dry_run !== false;
+  if (isDryRun) {
+    const before = await fetchBefore();
+    const etag = before?.["@odata.etag"];
+    const { token, expiresAt } = createPlanToken(toolName, target, payload, etag);
+    return ok({
+      plan_type: "DRY_RUN",
+      action,
+      target,
+      before: before ?? null,
+      after: buildAfter(),
+      confirm_token: token,
+      expires_at: expiresAt,
+      hint: `To apply, call ${toolName} again with dry_run=false and confirm_token="${token}".`,
+    });
+  }
+  if (!confirm_token) {
+    throw new Error(
+      "confirm_token is required when dry_run=false. Run with dry_run=true first to generate a plan.",
+    );
+  }
+  const entry = consumePlanToken(confirm_token, toolName, target, payload);
+  try {
+    const result = await apply(entry.etag);
+    return ok({ plan_type: "APPLIED", action, target, result });
+  } catch (e) {
+    if (e?.status === 412) {
+      throw new Error(
+        `Resource ${target} changed since the plan was computed (HTTP 412 Precondition Failed). Request a new plan with dry_run=true.`,
+      );
+    }
+    throw e;
+  }
+}
+
+// Shared zod fragments for the entity tools.
+const envInput = z
+  .string()
+  .optional()
+  .describe("Environment name from list_environments. Falls back to BC_DEFAULT_ENVIRONMENT.");
+const companyInput = z
+  .string()
+  .optional()
+  .describe("Company id (GUID) from list_companies. Falls back to BC_DEFAULT_COMPANY_ID.");
+const routeInput = z
+  .string()
+  .optional()
+  .describe(
+    'API route under /api/. Defaults to the standard "v2.0"; pass "{publisher}/{group}/{version}" for a custom AL API.',
+  );
+
+const server = new McpServer({ name: "business-central-mcp", version: VERSION });
+
+// ─── Read tools ─────────────────────────────────────────────────────────────
+
+server.registerTool(
+  "list_environments",
+  {
+    description:
+      "List all Business Central environments in the tenant (production + sandboxes) via the environment discovery API. Each environment's `name` is the `environment` argument to every other tool. Requires BC admin-center access; if this returns 401/403, pass known environment names directly to the other tools.",
+    inputSchema: {},
+  },
+  safeTool(async () => {
+    const data = await bcApi("GET", "/environments/v1.1");
+    const summary = (data.value ?? [])
+      .filter((e) => (e.applicationFamily ?? "BusinessCentral") === "BusinessCentral")
+      .map((e) => ({
+        name: e.name,
+        type: e.type,
+        countryCode: e.countryCode,
+        webClientUrl: e.webClientLoginUrl,
+      }));
+    return ok(summary);
+  }),
+);
+
+server.registerTool(
+  "list_companies",
+  {
+    description:
+      "List the companies (legal entities) in a Business Central environment. Each company's `id` (GUID) is the `company_id` argument to the entity tools.",
+    inputSchema: {
+      environment: envInput,
+    },
+  },
+  safeTool(async ({ environment }) => {
+    const env = resolveEnv(environment);
+    const data = await bcApi("GET", dataPath(env, "v2.0", "/companies"));
+    const summary = (data.value ?? []).map((c) => ({
+      id: c.id,
+      name: c.name,
+      displayName: c.displayName,
+      businessProfileId: c.businessProfileId || undefined,
+    }));
+    return ok(summary);
+  }),
+);
+
+server.registerTool(
+  "list_entity_sets",
+  {
+    description:
+      "List the entity sets (API endpoints) available on an API route — customers, items, salesInvoices, generalLedgerEntries, etc. Use the returned names as `entity_set` in query_entities. Defaults to the standard v2.0 API; pass api_route for a custom AL API.",
+    inputSchema: {
+      environment: envInput,
+      api_route: routeInput,
+    },
+  },
+  safeTool(async ({ environment, api_route }) => {
+    const env = resolveEnv(environment);
+    const route = resolveRoute(api_route);
+    const data = await bcApi("GET", dataPath(env, route, "/"));
+    return ok((data.value ?? []).map((s) => s.name ?? s.url).sort());
+  }),
+);
+
+server.registerTool(
+  "query_entities",
+  {
+    description:
+      "Query an entity set in a company with OData options ($filter, $select, $orderby, $expand). Returns up to `top` records (default 20) plus a nextLink when more pages exist; pass it back as `next_link` to page. Prefer $select to keep responses small — wide entities like generalLedgerEntries are truncated otherwise.",
+    inputSchema: {
+      entity_set: z
+        .string()
+        .describe("Entity set name from list_entity_sets (e.g. 'customers', 'salesInvoices')"),
+      environment: envInput,
+      company_id: companyInput,
+      api_route: routeInput,
+      filter: z
+        .string()
+        .optional()
+        .describe('OData $filter expression, e.g. "postingDate ge 2026-07-01 and amount gt 100"'),
+      select: z
+        .string()
+        .optional()
+        .describe("OData $select column list, e.g. 'number,displayName,balanceDue'"),
+      orderby: z.string().optional().describe("OData $orderby, e.g. 'postingDate desc'"),
+      expand: z.string().optional().describe("OData $expand, e.g. 'salesInvoiceLines'"),
+      top: z
+        .number()
+        .int()
+        .positive()
+        .max(1000)
+        .optional()
+        .describe("Max records to return per page. Defaults to 20."),
+      count: z
+        .boolean()
+        .optional()
+        .describe("Include the total matching record count as @odata.count."),
+      next_link: z.string().optional().describe("A nextLink from a previous response, for paging"),
+      full: z.boolean().optional().describe("Return untruncated payloads. Defaults to false."),
+    },
+  },
+  safeTool(
+    async ({
+      entity_set,
+      environment,
+      company_id,
+      api_route,
+      filter,
+      select,
+      orderby,
+      expand,
+      top,
+      count,
+      next_link,
+      full,
+    }) => {
+      // A nextLink is an already-constructed absolute URL; call it directly
+      // rather than re-deriving query params.
+      if (next_link) {
+        const token = await getToken();
+        const res = await fetch(next_link, {
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+        });
+        const text = await res.text();
+        if (!res.ok) throw new Error(`BusinessCentral GET nextLink -> ${res.status}: ${text}`);
+        const data = text ? JSON.parse(text) : {};
+        return ok({
+          count: data["@odata.count"],
+          records: full ? (data.value ?? []) : maybeTruncate(data.value ?? []),
+          nextLink: data["@odata.nextLink"] ?? null,
+        });
+      }
+      const env = resolveEnv(environment);
+      const route = resolveRoute(api_route);
+      const companyId = resolveCompany(company_id);
+      const data = await bcApi(
+        "GET",
+        companyPath(env, route, companyId, `/${encodeURIComponent(entity_set)}`),
+        undefined,
+        {
+          $filter: filter,
+          $select: select,
+          $orderby: orderby,
+          $expand: expand,
+          $top: top ?? 20,
+          $count: count ? "true" : undefined,
+        },
+      );
+      return ok({
+        count: data["@odata.count"],
+        records: full ? (data.value ?? []) : maybeTruncate(data.value ?? []),
+        nextLink: data["@odata.nextLink"] ?? null,
+      });
+    },
+  ),
+);
+
+server.registerTool(
+  "get_entity",
+  {
+    description:
+      "Get a single record by its id (GUID) from an entity set, including its @odata.etag (needed for update/delete concurrency). For records keyed by number/code, use query_entities with $filter instead.",
+    inputSchema: {
+      entity_set: z.string().describe("Entity set name from list_entity_sets"),
+      record_id: z.string().describe("The record's id (GUID)"),
+      environment: envInput,
+      company_id: companyInput,
+      api_route: routeInput,
+      expand: z.string().optional().describe("OData $expand, e.g. 'salesInvoiceLines'"),
+    },
+  },
+  safeTool(async ({ entity_set, record_id, environment, company_id, api_route, expand }) => {
+    const env = resolveEnv(environment);
+    const route = resolveRoute(api_route);
+    const companyId = resolveCompany(company_id);
+    const data = await bcApi(
+      "GET",
+      entityPath(env, route, companyId, entity_set, record_id),
+      undefined,
+      { $expand: expand },
+    );
+    return ok(data);
+  }),
+);
+
+// ─── Write tools — registered only when BC_MCP_MODE=write ──────────────────
+
+if (WRITE_ENABLED) {
+  server.registerTool(
+    "create_entity",
+    {
+      description:
+        "Create a new record in an entity set (e.g. a customer, item, or sales order header). WRITE OPERATION: this inserts real ERP data. Returns the created record including its id and @odata.etag.",
+      inputSchema: {
+        entity_set: z.string().describe("Entity set name from list_entity_sets"),
+        record: z
+          .record(z.unknown())
+          .describe("The record body as field/value pairs, e.g. {displayName: 'New Customer'}"),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: routeInput,
+      },
+    },
+    writeTool(
+      "create_entity",
+      ({ entity_set, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} set=${entity_set}`,
+      async ({ entity_set, record, environment, company_id, api_route }) => {
+        const env = resolveEnv(environment);
+        const route = resolveRoute(api_route);
+        const companyId = resolveCompany(company_id);
+        const data = await bcApi(
+          "POST",
+          companyPath(env, route, companyId, `/${encodeURIComponent(entity_set)}`),
+          record,
+        );
+        return ok({ created: true, record: data });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "update_entity",
+    {
+      description:
+        "Update fields on an existing record (PATCH). WRITE OPERATION: this modifies real ERP data. Concurrency-safe: uses the record's current @odata.etag as If-Match (fetched automatically unless `etag` is passed); a 412 means the record changed underneath you — re-read and retry.",
+      inputSchema: {
+        entity_set: z.string().describe("Entity set name from list_entity_sets"),
+        record_id: z.string().describe("The record's id (GUID)"),
+        record: z.record(z.unknown()).describe("Only the fields to change, e.g. {blocked: 'All'}"),
+        etag: z
+          .string()
+          .optional()
+          .describe("@odata.etag from a recent get_entity. Fetched automatically if omitted."),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: routeInput,
+      },
+    },
+    writeTool(
+      "update_entity",
+      ({ entity_set, record_id, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} set=${entity_set} id=${record_id}`,
+      async ({ entity_set, record_id, record, etag, environment, company_id, api_route }) => {
+        const env = resolveEnv(environment);
+        const route = resolveRoute(api_route);
+        const companyId = resolveCompany(company_id);
+        const path = entityPath(env, route, companyId, entity_set, record_id);
+        let ifMatch = etag;
+        if (!ifMatch) {
+          const current = await bcApi("GET", path);
+          ifMatch = current?.["@odata.etag"];
+        }
+        if (!ifMatch) {
+          throw new Error(
+            `Could not determine @odata.etag for ${entity_set}(${record_id}); pass etag explicitly.`,
+          );
+        }
+        const data = await bcApi("PATCH", path, record, undefined, { "If-Match": ifMatch });
+        return ok({ updated: true, record: data });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "invoke_bound_action",
+    {
+      description:
+        "Invoke an OData bound action on a record — e.g. 'post' on a salesInvoice, 'ship' on a salesOrder, 'cancel' on a postedInvoice. WRITE OPERATION with real business consequences: posting documents creates ledger entries that cannot simply be deleted. Know what the action does before calling it.",
+      inputSchema: {
+        entity_set: z.string().describe("Entity set name from list_entity_sets"),
+        record_id: z.string().describe("The record's id (GUID)"),
+        action_name: z
+          .string()
+          .describe(
+            "The bound action name, e.g. 'post', 'ship', 'cancel' (Microsoft.NAV.* is prefixed automatically)",
+          ),
+        body: z.record(z.unknown()).optional().describe("Optional action parameters as an object"),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: routeInput,
+      },
+    },
+    writeTool(
+      "invoke_bound_action",
+      ({ entity_set, record_id, action_name, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} set=${entity_set} id=${record_id} action=${action_name}`,
+      async ({ entity_set, record_id, action_name, body, environment, company_id, api_route }) => {
+        const env = resolveEnv(environment);
+        const route = resolveRoute(api_route);
+        const companyId = resolveCompany(company_id);
+        const action = action_name.includes(".") ? action_name : `Microsoft.NAV.${action_name}`;
+        const data = await bcApi(
+          "POST",
+          entityPath(env, route, companyId, entity_set, record_id) +
+            `/${encodeURIComponent(action)}`,
+          body && Object.keys(body).length ? body : undefined,
+        );
+        return ok({ invoked: true, action, result: data ?? null });
+      },
+    ),
+  );
+}
+
+// ─── Destructive tools — registered only when ──────────────────────────────
+//      BC_MCP_MODE=write AND BC_MCP_ALLOW_DELETE=true
+// Uses the dry_run/confirm_token plan-apply pattern: the plan step fetches the
+// existing record (captures its @odata.etag), shows what will be removed, and
+// returns a single-use token. The apply step (dry_run=false) requires that
+// token and uses If-Match for optimistic concurrency.
+
+if (DESTRUCTIVE_ENABLED) {
+  const planApplyInputs = {
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe("If true (default), return the planned change without applying."),
+    confirm_token: z
+      .string()
+      .optional()
+      .describe("Token returned by a recent dry_run. Required when dry_run=false."),
+  };
+
+  server.registerTool(
+    "delete_entity",
+    {
+      description:
+        "Permanently delete a record from an entity set. Two-step: first call (dry_run=true, default) returns the record that will be removed and a confirm_token; second call (dry_run=false with that token) deletes it. This cannot be undone. Posted documents cannot be deleted — use invoke_bound_action('cancel'/'creditMemo' flows) instead.",
+      inputSchema: {
+        entity_set: z.string().describe("Entity set name from list_entity_sets"),
+        record_id: z.string().describe("The record's id (GUID)"),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: routeInput,
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "delete_entity",
+      ({ entity_set, record_id, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} set=${entity_set} id=${record_id}`,
+      async ({
+        entity_set,
+        record_id,
+        environment,
+        company_id,
+        api_route,
+        dry_run,
+        confirm_token,
+      }) => {
+        const env = resolveEnv(environment);
+        const route = resolveRoute(api_route);
+        const companyId = resolveCompany(company_id);
+        const path = entityPath(env, route, companyId, entity_set, record_id);
+        const target = `env=${env} company=${companyId} set=${entity_set} id=${record_id}`;
+        return executePlanApply({
+          toolName: "delete_entity",
+          action: "delete",
+          target,
+          payload: { entity_set, record_id, env, companyId },
+          dry_run,
+          confirm_token,
+          fetchBefore: async () => {
+            const r = await fetchExistingOrNull(path);
+            if (!r) {
+              throw new Error(`${entity_set}(${record_id}) does not exist; nothing to delete.`);
+            }
+            return r;
+          },
+          buildAfter: () => null,
+          apply: (etag) =>
+            bcApi("DELETE", path, undefined, undefined, etag ? { "If-Match": etag } : {}),
+        });
+      },
+    ),
+  );
+}
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
