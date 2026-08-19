@@ -285,14 +285,35 @@ const CONTENT_TYPE_EXTENSIONS = {
   "application/json": ".json",
   "application/xml": ".xml",
   "text/xml": ".xml",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "application/vnd.ms-excel": ".xls",
+  "application/msword": ".doc",
 };
 
+// OOXML files are zip containers, so magic bytes alone report ".zip". The part
+// tree is named in the local file headers, and a scan of the first few KiB is
+// enough to tell a spreadsheet from a document from an actual archive.
+function sniffOoxml(buffer) {
+  const head = buffer.subarray(0, 4096).toString("latin1");
+  if (head.includes("xl/")) return ".xlsx";
+  if (head.includes("word/")) return ".docx";
+  if (head.includes("ppt/")) return ".pptx";
+  return ".zip";
+}
+
 function sniffExtension(buffer, contentType) {
-  for (const { ext, bytes } of MAGIC_EXTENSIONS) {
-    if (buffer.length >= bytes.length && bytes.every((b, i) => buffer[i] === b)) return ext;
-  }
+  // A specific declared type beats magic bytes. BC almost always declares
+  // application/octet-stream, in which case this falls through to sniffing.
   const base = (contentType || "").split(";")[0].trim().toLowerCase();
-  return CONTENT_TYPE_EXTENSIONS[base] ?? ".bin";
+  if (CONTENT_TYPE_EXTENSIONS[base]) return CONTENT_TYPE_EXTENSIONS[base];
+  for (const { ext, bytes } of MAGIC_EXTENSIONS) {
+    if (buffer.length >= bytes.length && bytes.every((b, i) => buffer[i] === b)) {
+      return ext === ".zip" ? sniffOoxml(buffer) : ext;
+    }
+  }
+  return ".bin";
 }
 
 // Strip path separators and characters Windows rejects. Exports frequently
@@ -323,6 +344,26 @@ function filenameFromDisposition(disposition) {
   return plain ? plain[1].trim() : null;
 }
 
+// Media entities (attachments, documentAttachments) keep the original upload
+// name in `fileName`, while the stream itself arrives as octet-stream with no
+// Content-Disposition. Without this an .xlsx would be saved as .zip, since a
+// spreadsheet is just a zip container. Entities with no such field — the
+// pdfDocument case — return null and fall back to a derived name.
+async function lookupRecordFileName(env, route, companyId, entitySet, recordId) {
+  try {
+    const record = await bcApi(
+      "GET",
+      entityPath(env, route, companyId, entitySet, recordId),
+      undefined,
+      { $select: "fileName" },
+    );
+    const name = record?.fileName;
+    return typeof name === "string" && name.trim() ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 // Decide where an export lands. An existing directory or a trailing separator
 // means "put it in here"; anything else is taken as the literal filename.
 function resolveExportTarget({
@@ -332,9 +373,8 @@ function resolveExportTarget({
   sub_path,
   buffer,
   contentType,
-  contentDisposition,
+  suggested,
 }) {
-  const suggested = filenameFromDisposition(contentDisposition);
   const leaf = String(sub_path).split("/").filter(Boolean).pop() ?? "content";
   const name = suggested
     ? safeFileName(suggested)
@@ -844,6 +884,9 @@ server.registerTool(
         {},
         max_bytes ?? MAX_EXPORT_BYTES,
       );
+      const suggested =
+        filenameFromDisposition(contentDisposition) ??
+        (await lookupRecordFileName(env, route, companyId, entity_set, record_id));
       const target = resolveExportTarget({
         output_path,
         entity_set,
@@ -851,7 +894,7 @@ server.registerTool(
         sub_path,
         buffer,
         contentType,
-        contentDisposition,
+        suggested,
       });
       if (existsSync(target) && overwrite !== true) {
         throw new Error(`${target} already exists. Pass overwrite=true to replace it.`);

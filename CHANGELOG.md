@@ -19,6 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `pdfDocument`. Previously any path containing `/` was percent-encoded into a
   single segment and returned 404.
 - `BC_EXPORT_DIR` environment variable — default destination for `export_file`.
+- Filename resolution for exports: the record's own `fileName` (attachments and
+  document attachments carry it) is preferred over a derived name, and OOXML
+  zip containers are inspected so a spreadsheet saves as `.xlsx` rather than
+  `.zip`. Format-agnostic — PDFs, Office files, and images all round-trip.
 
 ### Changed
 
