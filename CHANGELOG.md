@@ -8,13 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `export_file` read tool — downloads Business Central media streams (posted
+- `export_file` write-tier tool — downloads Business Central media streams (posted
   invoice PDFs, attachment content, item pictures) to a local file. Returns the
   path, byte count, content type, and SHA-256 instead of the bytes, keeping
   large documents out of the model's context. Guards: `max_bytes` ceiling
   (64 MiB default, checked against Content-Length and again after transfer),
   refusal to overwrite an existing file unless `overwrite: true`, and filename
   sanitisation so a server-supplied name cannot escape the target directory.
+  BC itself is only read, but the tool writes to the local filesystem, so it
+  registers under `BC_MCP_MODE=write` and is audit-logged like the other
+  write tools.
 - `sub_path` on `get_entity` — reads nested navigation properties such as
   `pdfDocument`. Previously any path containing `/` was percent-encoded into a
   single segment and returned 404.

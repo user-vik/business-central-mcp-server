@@ -21,7 +21,6 @@ signed-in user, constrained by that user's Business Central permission sets.
 | `list_entity_sets`  | List the entity sets on an API route (customers, items, salesInvoices, ...).                 |
 | `query_entities`    | OData query over an entity set — `$filter`/`$select`/`$orderby`/`$expand`, paged.            |
 | `get_entity`        | Single record by id (GUID), including its `@odata.etag`; `sub_path` walks nested navigation. |
-| `export_file`       | Download a document (invoice PDF, attachment, picture) to a local file.                      |
 
 Custom APIs published from AL extensions are reachable everywhere via
 `api_route: "{publisher}/{group}/{version}"`.
@@ -31,7 +30,9 @@ Custom APIs published from AL extensions are reachable everywhere via
 Business Central serves generated documents and uploaded files as OData media
 streams, not as JSON fields. `export_file` fetches those bytes and writes them
 to disk; the tool returns the path, size, and SHA-256 rather than the content,
-so a large PDF never lands in the model's context.
+so a large PDF never lands in the model's context. It only reads from BC, but
+because it writes to the local filesystem it registers in the **write** tier —
+set `BC_MCP_MODE=write` to use it.
 
 Inspect the media link first, then download it:
 
@@ -66,6 +67,7 @@ refused before anything is written.
 | `create_entity`       | Insert a record (customer, item, sales order, ...).                      |
 | `update_entity`       | PATCH fields on a record, `If-Match` etag concurrency handled for you.   |
 | `invoke_bound_action` | Call a bound action — `post`, `ship`, `cancel`, ... (`Microsoft.NAV.*`). |
+| `export_file`         | Download a document (invoice PDF, attachment, picture) to a local file.  |
 
 Every write call is audit-logged to stderr with timestamp, tool, target, and
 caller identity. **These mutate real ERP data** — posting a document creates

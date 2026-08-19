@@ -490,7 +490,7 @@ const DESTRUCTIVE_REQUESTED = process.env.BC_MCP_ALLOW_DELETE === "true";
 const DESTRUCTIVE_ENABLED = WRITE_ENABLED && DESTRUCTIVE_REQUESTED;
 if (WRITE_ENABLED) {
   console.error(
-    "[bc-mcp] write mode enabled — create/update/bound-action tools are exposed. These mutate real ERP data.",
+    "[bc-mcp] write mode enabled — create/update/bound-action/export tools are exposed. These mutate real ERP data or write local files.",
   );
 }
 if (DESTRUCTIVE_ENABLED) {
@@ -829,92 +829,95 @@ server.registerTool(
   ),
 );
 
-server.registerTool(
-  "export_file",
-  {
-    description:
-      "Download a binary document out of Business Central and save it to a local file — a posted invoice PDF, an attachment, or a picture. This reads from BC; the only write is to the local filesystem. Typical sub_path values: 'pdfDocument/pdfDocumentContent' on salesInvoices/salesCreditMemos/purchaseInvoices, 'content' on attachments, 'picture' on items. Call get_entity with the same sub_path first to confirm the media link exists.",
-    inputSchema: {
-      entity_set: z.string().describe("Entity set holding the record, e.g. 'salesInvoices'"),
-      record_id: z.string().describe("The record's id (GUID)"),
-      sub_path: z
-        .string()
-        .describe(
-          "Media navigation path beneath the record, e.g. 'pdfDocument/pdfDocumentContent'. Slashes are preserved.",
-        ),
-      output_path: z
-        .string()
-        .optional()
-        .describe(
-          "Destination file, or a directory to name the file automatically. Defaults to BC_EXPORT_DIR, else the working directory.",
-        ),
-      environment: envInput,
-      company_id: companyInput,
-      api_route: routeInput,
-      max_bytes: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe("Refuse downloads larger than this. Defaults to 64 MiB."),
-      overwrite: z
-        .boolean()
-        .optional()
-        .describe("Replace the destination file if it already exists. Defaults to false."),
-    },
-  },
-  safeTool(
-    async ({
-      entity_set,
-      record_id,
-      sub_path,
-      output_path,
-      environment,
-      company_id,
-      api_route,
-      max_bytes,
-      overwrite,
-    }) => {
-      const env = resolveEnv(environment);
-      const route = resolveRoute(api_route);
-      const companyId = resolveCompany(company_id);
-      const mediaPath = `${entityPath(env, route, companyId, entity_set, record_id)}/${encodeNavPath(sub_path)}`;
-      const { buffer, contentType, contentDisposition } = await bcApiBinary(
-        mediaPath,
-        {},
-        max_bytes ?? MAX_EXPORT_BYTES,
-      );
-      const suggested =
-        filenameFromDisposition(contentDisposition) ??
-        (await lookupRecordFileName(env, route, companyId, entity_set, record_id));
-      const target = resolveExportTarget({
-        output_path,
-        entity_set,
-        record_id,
-        sub_path,
-        buffer,
-        contentType,
-        suggested,
-      });
-      if (existsSync(target) && overwrite !== true) {
-        throw new Error(`${target} already exists. Pass overwrite=true to replace it.`);
-      }
-      mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, buffer);
-      return ok({
-        file: target,
-        bytes: buffer.length,
-        contentType,
-        sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
-        source: `${entity_set}(${record_id})/${sub_path}`,
-      });
-    },
-  ),
-);
-
 // ─── Write tools — registered only when BC_MCP_MODE=write ──────────────────
 
 if (WRITE_ENABLED) {
+  server.registerTool(
+    "export_file",
+    {
+      description:
+        "Download a binary document out of Business Central and save it to a local file — a posted invoice PDF, an attachment, or a picture. WRITE OPERATION: BC is only read, but the tool writes a file to the local filesystem, so it is gated behind write mode like every other tool with side effects. Typical sub_path values: 'pdfDocument/pdfDocumentContent' on salesInvoices/salesCreditMemos/purchaseInvoices, 'content' on attachments, 'picture' on items. Call get_entity with the same sub_path first to confirm the media link exists.",
+      inputSchema: {
+        entity_set: z.string().describe("Entity set holding the record, e.g. 'salesInvoices'"),
+        record_id: z.string().describe("The record's id (GUID)"),
+        sub_path: z
+          .string()
+          .describe(
+            "Media navigation path beneath the record, e.g. 'pdfDocument/pdfDocumentContent'. Slashes are preserved.",
+          ),
+        output_path: z
+          .string()
+          .optional()
+          .describe(
+            "Destination file, or a directory to name the file automatically. Defaults to BC_EXPORT_DIR, else the working directory.",
+          ),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: routeInput,
+        max_bytes: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Refuse downloads larger than this. Defaults to 64 MiB."),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe("Replace the destination file if it already exists. Defaults to false."),
+      },
+    },
+    writeTool(
+      "export_file",
+      ({ entity_set, record_id, sub_path, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} set=${entity_set} id=${record_id} media=${sub_path}`,
+      async ({
+        entity_set,
+        record_id,
+        sub_path,
+        output_path,
+        environment,
+        company_id,
+        api_route,
+        max_bytes,
+        overwrite,
+      }) => {
+        const env = resolveEnv(environment);
+        const route = resolveRoute(api_route);
+        const companyId = resolveCompany(company_id);
+        const mediaPath = `${entityPath(env, route, companyId, entity_set, record_id)}/${encodeNavPath(sub_path)}`;
+        const { buffer, contentType, contentDisposition } = await bcApiBinary(
+          mediaPath,
+          {},
+          max_bytes ?? MAX_EXPORT_BYTES,
+        );
+        const suggested =
+          filenameFromDisposition(contentDisposition) ??
+          (await lookupRecordFileName(env, route, companyId, entity_set, record_id));
+        const target = resolveExportTarget({
+          output_path,
+          entity_set,
+          record_id,
+          sub_path,
+          buffer,
+          contentType,
+          suggested,
+        });
+        if (existsSync(target) && overwrite !== true) {
+          throw new Error(`${target} already exists. Pass overwrite=true to replace it.`);
+        }
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, buffer);
+        return ok({
+          file: target,
+          bytes: buffer.length,
+          contentType,
+          sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
+          source: `${entity_set}(${record_id})/${sub_path}`,
+        });
+      },
+    ),
+  );
+
   server.registerTool(
     "create_entity",
     {
