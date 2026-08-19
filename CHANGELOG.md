@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-18
+
+### Added
+
+- `export_file` read tool — downloads Business Central media streams (posted
+  invoice PDFs, attachment content, item pictures) to a local file. Returns the
+  path, byte count, content type, and SHA-256 instead of the bytes, keeping
+  large documents out of the model's context. Guards: `max_bytes` ceiling
+  (64 MiB default, checked against Content-Length and again after transfer),
+  refusal to overwrite an existing file unless `overwrite: true`, and filename
+  sanitisation so a server-supplied name cannot escape the target directory.
+- `sub_path` on `get_entity` — reads nested navigation properties such as
+  `pdfDocument`. Previously any path containing `/` was percent-encoded into a
+  single segment and returned 404.
+- `BC_EXPORT_DIR` environment variable — default destination for `export_file`.
+
+### Changed
+
+- The HTTP layer is split into `bcFetch` (retry/auth) plus `bcApi` (JSON) and
+  `bcApiBinary` (buffered bytes). Previously every response was forced through
+  `JSON.parse` with `Accept: application/json`, which made binary retrieval
+  impossible.
+
 ## [1.0.0] - 2026-07-21
 
 ### Added
