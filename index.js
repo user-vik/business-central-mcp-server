@@ -902,11 +902,15 @@ if (WRITE_ENABLED) {
           contentType,
           suggested,
         });
-        if (existsSync(target) && overwrite !== true) {
-          throw new Error(`${target} already exists. Pass overwrite=true to replace it.`);
-        }
         mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, buffer);
+        try {
+          writeFileSync(target, buffer, { flag: overwrite === true ? "w" : "wx" });
+        } catch (e) {
+          if (e?.code === "EEXIST" && overwrite !== true) {
+            throw new Error(`${target} already exists. Pass overwrite=true to replace it.`);
+          }
+          throw e;
+        }
         return ok({
           file: target,
           bytes: buffer.length,
