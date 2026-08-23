@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -93,6 +94,9 @@ const DEFAULT_ENVIRONMENT = process.env.BC_DEFAULT_ENVIRONMENT || null;
 const DEFAULT_COMPANY_ID = process.env.BC_DEFAULT_COMPANY_ID || null;
 const MAX_RETRIES = 3;
 const RETRY_MAX_DELAY_MS = 60_000;
+// Ceiling for export_file downloads. BC attachments are user-uploaded and
+// unbounded; buffering one blindly would sit in memory for the session.
+const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
 
 async function getToken() {
   const t = await credential.getToken(SCOPE);
@@ -101,11 +105,15 @@ async function getToken() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Calls a path relative to BC_BASE (e.g. "/v2.0/Production/api/v2.0/companies").
-// `extraQuery` adds query parameters ($filter, $top, ...). `extraHeaders` adds
-// request headers (If-Match for OData optimistic concurrency on PATCH/DELETE).
-// Retries on HTTP 429/503, honoring Retry-After.
-async function bcApi(method, path, body, extraQuery = {}, extraHeaders = {}) {
+// Performs the HTTP call and returns the raw Response, retrying on 429/503 and
+// honoring Retry-After. Callers decide how to read the body — bcApi parses
+// JSON, bcApiBinary buffers bytes. `accept` is overridable because BC media
+// streams will not negotiate application/json.
+async function bcFetch(
+  method,
+  path,
+  { body, extraQuery = {}, extraHeaders = {}, accept = "application/json" } = {},
+) {
   const token = await getToken();
   const url = new URL(`${BC_BASE}${path}`);
   for (const [k, v] of Object.entries(extraQuery)) {
@@ -117,7 +125,7 @@ async function bcApi(method, path, body, extraQuery = {}, extraHeaders = {}) {
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
-        Accept: "application/json",
+        Accept: accept,
         ...extraHeaders,
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -133,14 +141,55 @@ async function bcApi(method, path, body, extraQuery = {}, extraHeaders = {}) {
       await sleep(backoffMs);
       continue;
     }
-    const text = await res.text();
-    if (!res.ok) {
-      const err = new Error(`BusinessCentral ${method} ${path} -> ${res.status}: ${text}`);
-      err.status = res.status;
-      throw err;
-    }
-    return text ? JSON.parse(text) : null;
+    return res;
   }
+}
+
+// Calls a path relative to BC_BASE (e.g. "/v2.0/Production/api/v2.0/companies")
+// and parses the JSON body. `extraQuery` adds query parameters ($filter,
+// $top, ...). `extraHeaders` adds request headers (If-Match for OData
+// optimistic concurrency on PATCH/DELETE).
+async function bcApi(method, path, body, extraQuery = {}, extraHeaders = {}) {
+  const res = await bcFetch(method, path, { body, extraQuery, extraHeaders });
+  const text = await res.text();
+  if (!res.ok) {
+    const err = new Error(`BusinessCentral ${method} ${path} -> ${res.status}: ${text}`);
+    err.status = res.status;
+    throw err;
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+// GETs a binary media stream (invoice PDFs, attachment content, pictures) and
+// buffers it. BC serves these as application/octet-stream, so the body must
+// never reach JSON.parse. Enforces `maxBytes` against the declared
+// Content-Length first, then against what actually arrived — a chunked
+// response has no length to check up front.
+async function bcApiBinary(path, extraQuery = {}, maxBytes = MAX_EXPORT_BYTES) {
+  const res = await bcFetch("GET", path, { extraQuery, accept: "*/*" });
+  if (!res.ok) {
+    const text = await res.text();
+    const err = new Error(`BusinessCentral GET ${path} -> ${res.status}: ${text}`);
+    err.status = res.status;
+    throw err;
+  }
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(
+      `Refusing to download ${declared} bytes; exceeds max_bytes=${maxBytes}. Raise max_bytes if this is expected.`,
+    );
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length > maxBytes) {
+    throw new Error(
+      `Downloaded ${buffer.length} bytes; exceeds max_bytes=${maxBytes}. Raise max_bytes if this is expected.`,
+    );
+  }
+  return {
+    buffer,
+    contentType: res.headers.get("content-type") ?? "application/octet-stream",
+    contentDisposition: res.headers.get("content-disposition") ?? null,
+  };
 }
 
 // Resolve the target environment for a call, falling back to the configured
@@ -200,6 +249,143 @@ function entityPath(env, route, companyId, entitySet, recordId) {
     companyId,
     `/${encodeURIComponent(entitySet)}(${encodeURIComponent(recordId)})`,
   );
+}
+
+// Encode a navigation path while preserving its separators. Values like
+// "pdfDocument/pdfDocumentContent" are multi-segment; running
+// encodeURIComponent over the whole string turns "/" into %2F and BC 404s.
+// Each segment is encoded independently so BC can decode key predicates (e.g.
+// "attachments(<id>)") correctly.
+  return String(navPath)
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+// BC labels most media as application/octet-stream regardless of the real
+// format, so the extension is sniffed from magic bytes first and only falls
+// back to the declared content type.
+const MAGIC_EXTENSIONS = [
+  { ext: ".pdf", bytes: [0x25, 0x50, 0x44, 0x46] },
+  { ext: ".png", bytes: [0x89, 0x50, 0x4e, 0x47] },
+  { ext: ".jpg", bytes: [0xff, 0xd8, 0xff] },
+  { ext: ".gif", bytes: [0x47, 0x49, 0x46, 0x38] },
+  // Also matches .xlsx/.docx — both are zip containers.
+  { ext: ".zip", bytes: [0x50, 0x4b, 0x03, 0x04] },
+];
+
+const CONTENT_TYPE_EXTENSIONS = {
+  "application/pdf": ".pdf",
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "text/csv": ".csv",
+  "text/plain": ".txt",
+  "application/json": ".json",
+  "application/xml": ".xml",
+  "text/xml": ".xml",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "application/vnd.ms-excel": ".xls",
+  "application/msword": ".doc",
+};
+
+// OOXML files are zip containers, so magic bytes alone report ".zip". The part
+// tree is named in the local file headers, and a scan of the first few KiB is
+// enough to tell a spreadsheet from a document from an actual archive.
+function sniffOoxml(buffer) {
+  const head = buffer.subarray(0, 4096).toString("latin1");
+  if (head.includes("xl/")) return ".xlsx";
+  if (head.includes("word/")) return ".docx";
+  if (head.includes("ppt/")) return ".pptx";
+  return ".zip";
+}
+
+function sniffExtension(buffer, contentType) {
+  // A specific declared type beats magic bytes. BC almost always declares
+  // application/octet-stream, in which case this falls through to sniffing.
+  const base = (contentType || "").split(";")[0].trim().toLowerCase();
+  if (CONTENT_TYPE_EXTENSIONS[base]) return CONTENT_TYPE_EXTENSIONS[base];
+  for (const { ext, bytes } of MAGIC_EXTENSIONS) {
+    if (buffer.length >= bytes.length && bytes.every((b, i) => buffer[i] === b)) {
+      return ext === ".zip" ? sniffOoxml(buffer) : ext;
+    }
+  }
+  return ".bin";
+}
+
+// Strip path separators and characters Windows rejects. Exports frequently
+// land in a OneDrive-synced folder, and a BC-supplied filename is untrusted
+// input — it must never escape the destination directory.
+function safeFileName(name) {
+  const cleaned = String(name)
+    // Stripping control characters is the point — they are illegal in filenames.
+    // eslint-disable-next-line no-control-regex
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/^\.+/, "")
+    .trim()
+    .slice(0, 120);
+  return cleaned || "export";
+}
+
+function filenameFromDisposition(disposition) {
+  if (!disposition) return null;
+  const encoded = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(disposition);
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      // Malformed RFC 5987 value — fall through to the plain form.
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(disposition);
+  return plain ? plain[1].trim() : null;
+}
+
+// Media entities (attachments, documentAttachments) keep the original upload
+// name in `fileName`, while the stream itself arrives as octet-stream with no
+// Content-Disposition. Without this an .xlsx would be saved as .zip, since a
+// spreadsheet is just a zip container. Entities with no such field — the
+// pdfDocument case — return null and fall back to a derived name.
+async function lookupRecordFileName(env, route, companyId, entitySet, recordId) {
+  try {
+    const record = await bcApi(
+      "GET",
+      entityPath(env, route, companyId, entitySet, recordId),
+      undefined,
+      { $select: "fileName" },
+    );
+    const name = record?.fileName;
+    return typeof name === "string" && name.trim() ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+// Decide where an export lands. An existing directory or a trailing separator
+// means "put it in here"; anything else is taken as the literal filename.
+function resolveExportTarget({
+  output_path,
+  entity_set,
+  record_id,
+  sub_path,
+  buffer,
+  contentType,
+  suggested,
+}) {
+  const leaf = String(sub_path).split("/").filter(Boolean).pop() ?? "content";
+  const name = suggested
+    ? safeFileName(suggested)
+    : `${safeFileName(entity_set)}_${safeFileName(record_id)}_${safeFileName(leaf)}${sniffExtension(buffer, contentType)}`;
+  if (!output_path) {
+    return resolve(process.env.BC_EXPORT_DIR || process.cwd(), name);
+  }
+  const candidate = resolve(output_path);
+  const isDirectory =
+    (existsSync(candidate) && statSync(candidate).isDirectory()) || /[\\/]$/.test(output_path);
+  return isDirectory ? resolve(candidate, name) : candidate;
 }
 
 // GET a resource and return null on 404 instead of throwing. Used by the
@@ -304,7 +490,7 @@ const DESTRUCTIVE_REQUESTED = process.env.BC_MCP_ALLOW_DELETE === "true";
 const DESTRUCTIVE_ENABLED = WRITE_ENABLED && DESTRUCTIVE_REQUESTED;
 if (WRITE_ENABLED) {
   console.error(
-    "[bc-mcp] write mode enabled — create/update/bound-action tools are exposed. These mutate real ERP data.",
+    "[bc-mcp] write mode enabled — create/update/bound-action/export tools are exposed. These mutate real ERP data or write local files.",
   );
 }
 if (DESTRUCTIVE_ENABLED) {
@@ -618,25 +804,124 @@ server.registerTool(
       company_id: companyInput,
       api_route: routeInput,
       expand: z.string().optional().describe("OData $expand, e.g. 'salesInvoiceLines'"),
+      sub_path: z
+        .string()
+        .optional()
+        .describe(
+          "Navigation path beneath the record, e.g. 'pdfDocument' or 'attachments'. Slashes are preserved, so multi-segment paths work. Media metadata read this way exposes an @odata.mediaReadLink; pass the same path to export_file to fetch the bytes.",
+        ),
     },
   },
-  safeTool(async ({ entity_set, record_id, environment, company_id, api_route, expand }) => {
-    const env = resolveEnv(environment);
-    const route = resolveRoute(api_route);
-    const companyId = resolveCompany(company_id);
-    const data = await bcApi(
-      "GET",
-      entityPath(env, route, companyId, entity_set, record_id),
-      undefined,
-      { $expand: expand },
-    );
-    return ok(data);
-  }),
+  safeTool(
+    async ({ entity_set, record_id, environment, company_id, api_route, expand, sub_path }) => {
+      const env = resolveEnv(environment);
+      const route = resolveRoute(api_route);
+      const companyId = resolveCompany(company_id);
+      const base = entityPath(env, route, companyId, entity_set, record_id);
+      const data = await bcApi(
+        "GET",
+        sub_path ? `${base}/${encodeNavPath(sub_path)}` : base,
+        undefined,
+        { $expand: expand },
+      );
+      return ok(data);
+    },
+  ),
 );
 
 // ─── Write tools — registered only when BC_MCP_MODE=write ──────────────────
 
 if (WRITE_ENABLED) {
+  server.registerTool(
+    "export_file",
+    {
+      description:
+        "Download a binary document out of Business Central and save it to a local file — a posted invoice PDF, an attachment, or a picture. WRITE OPERATION: BC is only read, but the tool writes a file to the local filesystem, so it is gated behind write mode like every other tool with side effects. Typical sub_path values: 'pdfDocument/pdfDocumentContent' on salesInvoices/salesCreditMemos/purchaseInvoices, 'content' on attachments, 'picture' on items. Call get_entity with the same sub_path first to confirm the media link exists.",
+      inputSchema: {
+        entity_set: z.string().describe("Entity set holding the record, e.g. 'salesInvoices'"),
+        record_id: z.string().describe("The record's id (GUID)"),
+        sub_path: z
+          .string()
+          .describe(
+            "Media navigation path beneath the record, e.g. 'pdfDocument/pdfDocumentContent'. Slashes are preserved.",
+          ),
+        output_path: z
+          .string()
+          .optional()
+          .describe(
+            "Destination file, or a directory to name the file automatically. Defaults to BC_EXPORT_DIR, else the working directory.",
+          ),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: routeInput,
+        max_bytes: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Refuse downloads larger than this. Defaults to 64 MiB."),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe("Replace the destination file if it already exists. Defaults to false."),
+      },
+    },
+    writeTool(
+      "export_file",
+      ({ entity_set, record_id, sub_path, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} set=${entity_set} id=${record_id} media=${sub_path}`,
+      async ({
+        entity_set,
+        record_id,
+        sub_path,
+        output_path,
+        environment,
+        company_id,
+        api_route,
+        max_bytes,
+        overwrite,
+      }) => {
+        const env = resolveEnv(environment);
+        const route = resolveRoute(api_route);
+        const companyId = resolveCompany(company_id);
+        const mediaPath = `${entityPath(env, route, companyId, entity_set, record_id)}/${encodeNavPath(sub_path)}`;
+        const { buffer, contentType, contentDisposition } = await bcApiBinary(
+          mediaPath,
+          {},
+          max_bytes ?? MAX_EXPORT_BYTES,
+        );
+        const suggested =
+          filenameFromDisposition(contentDisposition) ??
+          (await lookupRecordFileName(env, route, companyId, entity_set, record_id));
+        const target = resolveExportTarget({
+          output_path,
+          entity_set,
+          record_id,
+          sub_path,
+          buffer,
+          contentType,
+          suggested,
+        });
+        mkdirSync(dirname(target), { recursive: true });
+        try {
+          writeFileSync(target, buffer, { flag: overwrite === true ? "w" : "wx" });
+        } catch (e) {
+          if (e?.code === "EEXIST" && overwrite !== true) {
+            throw new Error(`${target} already exists. Pass overwrite=true to replace it.`);
+          }
+          throw e;
+        }
+        return ok({
+          file: target,
+          bytes: buffer.length,
+          contentType,
+          sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
+          source: `${entity_set}(${record_id})/${sub_path}`,
+        });
+      },
+    ),
+  );
+
   server.registerTool(
     "create_entity",
     {
