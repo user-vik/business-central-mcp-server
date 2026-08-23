@@ -254,8 +254,8 @@ function entityPath(env, route, companyId, entitySet, recordId) {
 // Encode a navigation path while preserving its separators. Values like
 // "pdfDocument/pdfDocumentContent" are multi-segment; running
 // encodeURIComponent over the whole string turns "/" into %2F and BC 404s.
-// Key predicates survive as-is — encodeURIComponent leaves parentheses alone.
-function encodeNavPath(navPath) {
+// Each segment is encoded independently so BC can decode key predicates (e.g.
+// "attachments(<id>)") correctly.
   return String(navPath)
     .split("/")
     .filter(Boolean)
