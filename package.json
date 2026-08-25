@@ -1,7 +1,7 @@
 {
   "name": "business-central-mcp-server",
   "version": "1.1.0",
-  "description": "MCP server for Dynamics 365 Business Central — query and manage ERP data via the standard v2.0 and custom AL APIs",
+  "description": "MCP server for Dynamics 365 Business Central \u2014 query and manage ERP data via the standard v2.0 and custom AL APIs",
   "type": "module",
   "main": "index.js",
   "bin": {
@@ -9,6 +9,8 @@
   },
   "scripts": {
     "start": "node index.js",
+    "check": "node --check index.js",
+    "test": "node scripts/smoke-test.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

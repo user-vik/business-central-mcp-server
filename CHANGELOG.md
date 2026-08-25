@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Restored the `encodeNavPath` function declaration. An automated comment
+  rewrite in a43759b replaced the two lines above the function body and took
+  the `function encodeNavPath(navPath) {` line with them, leaving a top-level
+  `return`. `index.js` then failed to parse as ESM, so the server could not
+  start at all. Present on `main` from 83cbc0e onward; no tagged release is
+  affected.
+
+### Added
+
+- `npm test` — a stdio smoke test that spawns the real entry point, completes
+  the MCP handshake, and asserts the exact tool surface for read mode, write
+  mode, delete opt-in, and delete opt-in without write mode. Lint alone cannot
+  see an import-time crash or a tool that stops registering.
+- `npm run check` — parses `index.js` as ESM. A bare `node --check` on a copy
+  of the file outside this package parses it as CommonJS, where a top-level
+  `return` is legal, and reports nothing.
+- CI workflow running the parse check, lint, format check, and smoke tests on
+  Node 20 and 22 across Linux and Windows, on every pull request.
+
+### Changed
+
+- `package-lock.json` version synced to 1.1.0; it was still at 1.0.0.
+
 ## [1.1.0] - 2026-08-18
 
 ### Added

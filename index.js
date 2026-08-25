@@ -256,6 +256,7 @@ function entityPath(env, route, companyId, entitySet, recordId) {
 // encodeURIComponent over the whole string turns "/" into %2F and BC 404s.
 // Each segment is encoded independently so BC can decode key predicates (e.g.
 // "attachments(<id>)") correctly.
+function encodeNavPath(navPath) {
   return String(navPath)
     .split("/")
     .filter(Boolean)
