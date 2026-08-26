@@ -119,7 +119,7 @@ for (const testCase of CASES) {
       extensionPath: INSTALLED,
       systemDirs: SYSTEM_DIRS,
       userConfig: testCase.userConfig,
-      pathSeparator: "/",
+      pathSeparator: process.platform === "win32" ? "\\" : "/",
     });
 
     if (!config) {
