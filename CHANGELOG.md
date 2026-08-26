@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `set_item_attribute` write-tier tool — sets an item attribute (e.g. "Group
+  Name" → "Roll") without the caller needing to know the underlying data model.
+  Resolves the attribute name and target value against the live definitions
+  (exact match first, then case-insensitive; ambiguity and unknown values are
+  errors — the tool never creates new dropdown options), verifies the item
+  exists where the route allows it, then updates or creates the Item Attribute
+  Value Mapping row through a two-step `dry_run` → `confirm_token` → apply flow
+  with `If-Match` concurrency, re-reading the row afterwards to verify.
+  Requires a custom AL API route that publishes `itemAttributes`,
+  `itemAttributeValues`, and `itemAttributeValueMappings` (the standard v2.0
+  API exposes none of them) via `api_route` or the new `BC_ITEM_ATTR_API_ROUTE`
+  environment variable. Option-type attributes only.
 - Claude Desktop bundle (`.mcpb`). `npm run build:mcpb` produces a single-file,
   cross-platform installer that carries the server and its production
   dependencies; Desktop supplies the Node runtime, so installing needs no
