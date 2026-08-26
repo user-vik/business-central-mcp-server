@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `engines` declares >=20; Claude Desktop bundles its own Node, so the
+        # floor and a current release are both worth proving.
+        node: ["20", "22"]
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # Parses index.js as ESM. Cheap, and fails loudly on the class of edit
+      # that rewrites a comment block and eats the line beneath it.
+      - run: npm run check
+
+      - run: npm run lint
+
+      - run: npm run format:check
+
+      # Boots the real server over stdio and asserts the tool surface per mode.
+      - run: npm test
