@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Desktop performs. Covers interactive sign-in with every optional field left
   blank, write mode with deletion, service-principal sign-in, and the refusal
   to launch with no tenant.
+- Interactive sign-in now names the client id it will use on stderr, and says
+  when it is the public Azure CLI client. The tool surface alone could not
+  distinguish the fallback from a literal placeholder, because `tools/list`
+  never requests a token.
 - Release workflow: a `v*` tag builds, verifies, and attaches the `.mcpb` to a
   GitHub release, after checking the tag agrees with `package.json`.
 - `npm test` — a stdio smoke test that spawns the real entry point, completes
@@ -39,6 +43,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `return`. `index.js` then failed to parse as ESM, so the server could not
   start at all. Present on `main` from 83cbc0e onward; no tagged release is
   affected.
+- Blank and unsubstituted `${user_config.<key>}` entries are now deleted from
+  `process.env` at startup rather than filtered at each read site. Guarding
+  this module's reads was not enough: `@azure/identity` reads
+  `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` directly from
+  the environment in `EnvironmentCredential`, which `DefaultAzureCredential`
+  (`BC_AUTH_MODE=default`) chains into, so three surviving placeholders looked
+  like a complete service principal and it would attempt a client-secret flow
+  with literal `${...}` strings. Discarded names are reported on stderr.
+- `BC_MCP_MODE` now refuses to start on an unrecognised value instead of
+  quietly falling back to read mode, matching how `BC_AUTH_MODE` already
+  behaved. The value arrives as free text from the install dialog, since the
+  manifest schema has no enum for string fields, and a typo previously left the
+  user hunting for tools that were never registered.
+- `export_dir` no longer declares a `${DOCUMENTS}` default. System directories
+  are not expanded inside a `user_config` value, and `required` is validated
+  against the raw user config rather than merged defaults, so accepting a
+  prefilled literal would have satisfied the check and sent `${DOCUMENTS}` to
+  the server, which then fell back to the client's working directory.
 - Unset environment variables that arrive as an unsubstituted
   `${user_config.<key>}` are now treated as unset rather than as a literal
   value. MCPB clients pass the placeholder through verbatim when an optional

@@ -50,10 +50,12 @@ const SYSTEM_DIRS = {
 
 const TENANT = "00000000-0000-0000-0000-000000000000";
 
-// `export_dir` is required, so Desktop always collects a real path through its
-// directory picker. It cannot be left to the manifest default: the toolkit
-// expands system directories *before* user_config values, so a `${DOCUMENTS}`
-// default would reach the server as that literal string rather than a path.
+// `export_dir` is required and declares no default, so Desktop collects a real
+// path through its directory picker. A `${DOCUMENTS}` default cannot stand in:
+// the toolkit expands system directories *before* user_config values, so it
+// would reach the server as that literal string, and `hasRequiredConfigMissing`
+// inspects only userConfig, so accepting a prefilled literal would satisfy
+// `required` and land a placeholder in the environment.
 const EXPORT_DIR = join(INSTALLED, "home", "Documents");
 
 const READ_TOOLS = [
@@ -140,7 +142,7 @@ for (const testCase of CASES) {
       }
     }
 
-    const actual = await listTools({
+    const { tools: actual } = await listTools({
       command: config.command,
       args: config.args,
       env: config.env,

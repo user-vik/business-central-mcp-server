@@ -94,17 +94,17 @@ own Node runtime and the bundle carries its dependencies.
 
 The install dialog collects:
 
-| Field                      | Required | Notes                                                                                |
-| -------------------------- | -------- | ------------------------------------------------------------------------------------ |
-| **Entra tenant ID**        | yes      | The tenant GUID your Business Central lives in.                                      |
-| **Export folder**          | yes      | Where `export_file` saves documents. Prefilled with your Documents folder.           |
-| **Sign-in method**         | no       | Defaults to `interactive`. Also `service-principal`, `cli`, `azure-powershell`.      |
-| **Server mode**            | no       | Defaults to `read`. Set to `write` to expose create/update/bound actions and export. |
-| **Allow record deletion**  | no       | Off by default. Requires write mode; ignored without it.                             |
-| **Default environment**    | no       | Skip passing `environment` on every call.                                            |
-| **Default company ID**     | no       | Skip passing `company_id` on every call.                                             |
-| **Client ID / secret**     | no       | Service-principal sign-in only. The secret is held by the OS credential manager.     |
-| **Token scope / API base** | no       | Sovereign cloud or embedded ISV deployments only.                                    |
+| Field                      | Required | Notes                                                                            |
+| -------------------------- | -------- | -------------------------------------------------------------------------------- |
+| **Entra tenant ID**        | yes      | The tenant GUID your Business Central lives in.                                  |
+| **Export folder**          | yes      | Where `export_file` saves documents. Pick a folder you can write to.             |
+| **Sign-in method**         | no       | Defaults to `interactive`. Also `service-principal`, `cli`, `azure-powershell`.  |
+| **Server mode**            | no       | `read` (default) or `write`. Anything else refuses to start.                     |
+| **Allow record deletion**  | no       | Off by default. Requires write mode; ignored without it.                         |
+| **Default environment**    | no       | Skip passing `environment` on every call.                                        |
+| **Default company ID**     | no       | Skip passing `company_id` on every call.                                         |
+| **Client ID / secret**     | no       | Service-principal sign-in only. The secret is held by the OS credential manager. |
+| **Token scope / API base** | no       | Sovereign cloud or embedded ISV deployments only.                                |
 
 With the default `interactive` sign-in, leave client ID and secret blank. The
 server falls back to the public Azure CLI client, opens your browser, and acts

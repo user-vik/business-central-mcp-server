@@ -16,7 +16,13 @@ export function cleanEnv(overrides) {
   return { ...env, ...overrides };
 }
 
-// Completes the MCP handshake and resolves the sorted tool names.
+// Completes the MCP handshake and resolves `{ tools, stderr }`, where `tools`
+// is the sorted tool names.
+//
+// Resolution waits for the child to close rather than firing the moment the
+// tools/list response lands, so `stderr` is complete. Startup diagnostics are
+// written during module load, but stderr is a separate pipe with no ordering
+// guarantee against stdout, and callers assert on those lines.
 //
 // `command` defaults to the current interpreter. A manifest says `"node"`,
 // which Claude Desktop resolves to the runtime it ships; mapping that to
@@ -32,28 +38,35 @@ export function listTools({ command = process.execPath, args, env, timeoutMs } =
 
     let stdout = "";
     let stderr = "";
+    let tools;
+    let settled = false;
+
     const timer = setTimeout(() => {
       child.kill();
-      rejectPromise(new Error(`timed out after ${limit}ms\n${stderr}`));
+      fail(new Error(`timed out after ${limit}ms\n${stderr}`));
     }, limit);
 
-    const finish = (error, value) => {
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       child.kill();
-      if (error) rejectPromise(error);
-      else resolvePromise(value);
+      rejectPromise(error);
     };
+
+    child.on("close", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (tools) resolvePromise({ tools, stderr });
+      else rejectPromise(new Error(`server closed before tools/list\n${stderr}`));
+    });
 
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
-    child.stdin.on("error", (error) => finish(error));
-    child.on("error", (error) => finish(error));
-    child.on("exit", (code) => {
-      if (code !== 0 && code !== null) {
-        finish(new Error(`server exited with code ${code}\n${stderr}`));
-      }
-    });
+    child.stdin.on("error", (error) => fail(error));
+    child.on("error", (error) => fail(error));
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
@@ -67,15 +80,17 @@ export function listTools({ command = process.execPath, args, env, timeoutMs } =
         try {
           message = JSON.parse(line);
         } catch {
-          finish(new Error(`non-JSON line on stdout: ${line}`));
+          fail(new Error(`non-JSON line on stdout: ${line}`));
           return;
         }
         if (message.id === 2) {
           if (message.error) {
-            finish(new Error(`tools/list failed: ${JSON.stringify(message.error)}`));
+            fail(new Error(`tools/list failed: ${JSON.stringify(message.error)}`));
             return;
           }
-          finish(null, message.result.tools.map((tool) => tool.name).sort());
+          tools = message.result.tools.map((tool) => tool.name).sort();
+          // Shut the server down; `close` resolves once stderr has drained.
+          child.kill();
         }
       }
     });

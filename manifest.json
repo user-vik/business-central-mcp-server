@@ -85,8 +85,7 @@
     "export_dir": {
       "type": "directory",
       "title": "Export folder",
-      "description": "Where export_file saves invoice PDFs, attachments, and pictures. Prefilled with your Documents folder; confirm or pick another.",
-      "default": "${DOCUMENTS}",
+      "description": "Where export_file saves invoice PDFs, attachments, and pictures. Pick a folder you can write to.",
       "required": true
     },
     "client_id": {

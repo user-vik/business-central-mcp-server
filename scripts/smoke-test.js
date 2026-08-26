@@ -25,6 +25,10 @@ const BASE_ENV = {
   AZURE_CLIENT_SECRET: "smoke-test",
 };
 
+// Mirrors AZURE_CLI_CLIENT_ID in index.js. Interactive sign-in falls back to
+// this public client when no client id is configured.
+const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+
 const READ_TOOLS = [
   "get_entity",
   "list_companies",
@@ -59,8 +63,12 @@ const CASES = [
   },
   {
     // An MCPB client passes `${user_config.<key>}` through verbatim when an
-    // optional field is blank and the manifest gives it no default. Interactive
-    // mode must still boot and fall back to the Azure CLI client id.
+    // optional field is blank and the manifest gives it no default.
+    //
+    // Asserting the tool surface alone would not catch a regression here:
+    // tools/list never requests a token, so a credential built with the literal
+    // as its client id still lists five tools. The stderr assertions are what
+    // make this bite.
     name: "interactive survives unsubstituted placeholders",
     env: {
       BC_AUTH_MODE: "interactive",
@@ -69,6 +77,25 @@ const CASES = [
       AZURE_CLIENT_SECRET: "${user_config.client_secret}",
     },
     expected: READ_TOOLS,
+    expectStderr: [
+      new RegExp(`interactive sign-in as client ${AZURE_CLI_CLIENT_ID}`),
+      /interactive sign-in as client .*public Azure CLI client/,
+      /ignoring unsubstituted configuration:.*AZURE_CLIENT_ID/,
+      /ignoring unsubstituted configuration:.*AZURE_CLIENT_SECRET/,
+    ],
+  },
+  {
+    // The counterpart: a real client id must be used verbatim, so the case
+    // above is proving a fallback rather than a constant.
+    name: "interactive honours an explicit client id",
+    env: {
+      BC_AUTH_MODE: "interactive",
+      AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000",
+      AZURE_CLIENT_ID: "11111111-2222-3333-4444-555555555555",
+    },
+    expected: READ_TOOLS,
+    expectStderr: [/interactive sign-in as client 11111111-2222-3333-4444-555555555555$/m],
+    rejectStderr: [/public Azure CLI client/],
   },
 ];
 
@@ -87,21 +114,43 @@ const REFUSAL_CASES = [
     env: { BC_AUTH_MODE: "interactive", AZURE_TENANT_ID: "" },
     expectStderr: /requires AZURE_TENANT_ID/,
   },
+  {
+    // BC_MCP_MODE arrives as free text from the install dialog, because the
+    // manifest schema has no enum for string fields. A typo used to degrade
+    // silently to read mode, leaving the user hunting for absent tools.
+    name: "unrecognised BC_MCP_MODE refuses to start",
+    env: { BC_MCP_MODE: "readwrite" },
+    expectStderr: /Invalid BC_MCP_MODE "readwrite"/,
+  },
 ];
 
 let failed = 0;
 
 for (const testCase of CASES) {
   try {
-    const actual = await listTools({ args: [ENTRY], env: { ...BASE_ENV, ...testCase.env } });
+    const { tools, stderr } = await listTools({
+      args: [ENTRY],
+      env: { ...BASE_ENV, ...testCase.env },
+    });
     const expected = [...testCase.expected].sort();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    const problems = [];
+    if (JSON.stringify(tools) !== JSON.stringify(expected)) {
+      problems.push(`expected tools: ${expected.join(", ")}`);
+      problems.push(`actual tools:   ${tools.join(", ")}`);
+    }
+    for (const pattern of testCase.expectStderr ?? []) {
+      if (!pattern.test(stderr)) problems.push(`stderr missing ${pattern}`);
+    }
+    for (const pattern of testCase.rejectStderr ?? []) {
+      if (pattern.test(stderr)) problems.push(`stderr unexpectedly matched ${pattern}`);
+    }
+    if (problems.length > 0) {
       console.error(`FAIL  ${testCase.name}`);
-      console.error(`      expected: ${expected.join(", ")}`);
-      console.error(`      actual:   ${actual.join(", ")}`);
+      for (const problem of problems) console.error(`      ${problem}`);
+      if (stderr.trim()) console.error(`      stderr: ${stderr.trim()}`);
       failed += 1;
     } else {
-      console.log(`ok    ${testCase.name} (${actual.length} tools)`);
+      console.log(`ok    ${testCase.name} (${tools.length} tools)`);
     }
   } catch (error) {
     console.error(`FAIL  ${testCase.name}: ${error.message}`);

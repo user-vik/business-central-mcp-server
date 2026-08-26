@@ -81,7 +81,7 @@ step("verifying the bundled server");
 const entry = join(BUNDLE, "server", "index.js");
 const declared = manifest.tools.map((tool) => tool.name).sort();
 // Most permissive configuration, so every tool the server can register does.
-const actual = await listTools({
+const { tools: actual } = await listTools({
   args: [entry],
   env: {
     BC_AUTH_MODE: "service-principal",
