@@ -85,7 +85,49 @@ first: `dry_run=true` (the default) returns the record that would be removed
 plus a single-use `confirm_token`; only a second call with `dry_run=false` and
 that token performs the delete, guarded by an `If-Match` etag.
 
-## Setup
+## Install in Claude Desktop
+
+Download `business-central-mcp-server-<version>.mcpb` from the
+[latest release](../../releases/latest) and open it. That is the whole install
+— no clone, no `npm install`, no Node on your machine. Claude Desktop ships its
+own Node runtime and the bundle carries its dependencies.
+
+The install dialog collects:
+
+| Field                      | Required | Notes                                                                                |
+| -------------------------- | -------- | ------------------------------------------------------------------------------------ |
+| **Entra tenant ID**        | yes      | The tenant GUID your Business Central lives in.                                      |
+| **Export folder**          | yes      | Where `export_file` saves documents. Prefilled with your Documents folder.           |
+| **Sign-in method**         | no       | Defaults to `interactive`. Also `service-principal`, `cli`, `azure-powershell`.      |
+| **Server mode**            | no       | Defaults to `read`. Set to `write` to expose create/update/bound actions and export. |
+| **Allow record deletion**  | no       | Off by default. Requires write mode; ignored without it.                             |
+| **Default environment**    | no       | Skip passing `environment` on every call.                                            |
+| **Default company ID**     | no       | Skip passing `company_id` on every call.                                             |
+| **Client ID / secret**     | no       | Service-principal sign-in only. The secret is held by the OS credential manager.     |
+| **Token scope / API base** | no       | Sovereign cloud or embedded ISV deployments only.                                    |
+
+With the default `interactive` sign-in, leave client ID and secret blank. The
+server falls back to the public Azure CLI client, opens your browser, and acts
+as the signed-in user under that user's Business Central permission sets. There
+is no app registration and no admin consent to arrange.
+
+The browser prompt returns on every Claude Desktop restart. Tokens are held in
+memory only; persisting them would require a native credential-cache module and
+a separate bundle per platform.
+
+### Building the bundle yourself
+
+```bash
+npm ci
+npm run build:mcpb    # writes dist/business-central-mcp-server-<version>.mcpb
+npm run verify:mcpb   # unpacks it and boots the server the way Desktop would
+```
+
+`build:mcpb` refuses to produce a bundle whose manifest version disagrees with
+`package.json`, or whose declared tool list disagrees with what the server
+actually registers.
+
+## Setup (Claude Code and other MCP clients)
 
 ```bash
 cd business-central-mcp-server
@@ -140,8 +182,9 @@ including all supported auth modes.
 
 ## Requirements
 
-- Node.js >= 20
 - An Entra identity licensed for Business Central in the target tenant.
+- Node.js >= 20, if you are running from source. The Claude Desktop bundle has
+  no such requirement; Desktop provides the runtime.
 
 ## License
 

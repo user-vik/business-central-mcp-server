@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Claude Desktop bundle (`.mcpb`). `npm run build:mcpb` produces a single-file,
+  cross-platform installer that carries the server and its production
+  dependencies; Desktop supplies the Node runtime, so installing needs no
+  clone, no npm, and no Node. Configuration is collected through the install
+  dialog rather than an `env` block.
+- `npm run verify:mcpb` — unpacks the packed bundle and boots the server out of
+  the archive using the MCPB toolkit's own config substitution, the same one
+  Desktop performs. Covers interactive sign-in with every optional field left
+  blank, write mode with deletion, service-principal sign-in, and the refusal
+  to launch with no tenant.
+- Release workflow: a `v*` tag builds, verifies, and attaches the `.mcpb` to a
+  GitHub release, after checking the tag agrees with `package.json`.
+- `npm test` — a stdio smoke test that spawns the real entry point, completes
+  the MCP handshake, and asserts the exact tool surface for read mode, write
+  mode, delete opt-in, delete opt-in without write mode, and a run where every
+  optional value arrives as an unsubstituted placeholder.
+- `npm run check` — parses `index.js` as ESM. A bare `node --check` on a copy
+  of the file outside this package parses it as CommonJS, where a top-level
+  `return` is legal, and reports nothing.
+- CI running the parse check, lint, format check, smoke tests, and a full
+  bundle build and verify on Node 20 and 22 across Linux and Windows, on every
+  pull request.
+
 ### Fixed
 
 - Restored the `encodeNavPath` function declaration. An automated comment
@@ -14,18 +39,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `return`. `index.js` then failed to parse as ESM, so the server could not
   start at all. Present on `main` from 83cbc0e onward; no tagged release is
   affected.
-
-### Added
-
-- `npm test` — a stdio smoke test that spawns the real entry point, completes
-  the MCP handshake, and asserts the exact tool surface for read mode, write
-  mode, delete opt-in, and delete opt-in without write mode. Lint alone cannot
-  see an import-time crash or a tool that stops registering.
-- `npm run check` — parses `index.js` as ESM. A bare `node --check` on a copy
-  of the file outside this package parses it as CommonJS, where a top-level
-  `return` is legal, and reports nothing.
-- CI workflow running the parse check, lint, format check, and smoke tests on
-  Node 20 and 22 across Linux and Windows, on every pull request.
+- Unset environment variables that arrive as an unsubstituted
+  `${user_config.<key>}` are now treated as unset rather than as a literal
+  value. MCPB clients pass the placeholder through verbatim when an optional
+  field is blank and the manifest declares no default for it. The literal is
+  truthy, so `AZURE_CLIENT_ID` in particular would defeat the Azure CLI
+  client-id fallback and interactive sign-in would fail against Entra with an
+  error that named nothing useful. All environment reads now go through one
+  guard that rejects blank and placeholder values.
 
 ### Changed
 

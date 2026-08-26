@@ -11,6 +11,8 @@
     "start": "node index.js",
     "check": "node --check index.js",
     "test": "node scripts/smoke-test.js",
+    "build:mcpb": "node scripts/build-mcpb.js",
+    "verify:mcpb": "node scripts/verify-bundle.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
@@ -48,6 +50,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@anthropic-ai/mcpb": "^2.1.2",
     "@eslint/js": "^9.15.0",
     "eslint": "^9.15.0",
     "eslint-config-prettier": "^9.1.0",

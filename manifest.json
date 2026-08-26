@@ -1,0 +1,170 @@
+{
+  "manifest_version": "0.3",
+  "name": "business-central-mcp-server",
+  "display_name": "Dynamics 365 Business Central",
+  "version": "1.1.0",
+  "description": "Query and manage Dynamics 365 Business Central ERP data through the standard v2.0 and custom AL APIs.",
+  "long_description": "Reads Business Central over its OData APIs: environments, companies, entity sets, filtered queries, and single records. Read-only by default. Write mode adds create, update, bound actions such as posting a document, and binary export of invoice PDFs and attachments. Deletion is a separate opt-in and requires a two-step plan/apply confirmation.\n\nSign-in uses your own Entra account through an interactive browser prompt, so the server acts as you and inherits your Business Central permission sets. A service principal is also supported for non-interactive use.",
+  "author": {
+    "name": "Victor Perez",
+    "url": "https://github.com/user-vik"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user-vik/business-central-mcp-server"
+  },
+  "homepage": "https://github.com/user-vik/business-central-mcp-server",
+  "documentation": "https://github.com/user-vik/business-central-mcp-server#readme",
+  "support": "https://github.com/user-vik/business-central-mcp-server/issues",
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": ["business-central", "dynamics-365", "erp", "odata", "microsoft"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "BC_MCP_MODE": "${user_config.mode}",
+        "BC_MCP_ALLOW_DELETE": "${user_config.allow_delete}",
+        "BC_AUTH_MODE": "${user_config.auth_mode}",
+        "AZURE_TENANT_ID": "${user_config.tenant_id}",
+        "AZURE_CLIENT_ID": "${user_config.client_id}",
+        "AZURE_CLIENT_SECRET": "${user_config.client_secret}",
+        "BC_DEFAULT_ENVIRONMENT": "${user_config.environment}",
+        "BC_DEFAULT_COMPANY_ID": "${user_config.company_id}",
+        "BC_EXPORT_DIR": "${user_config.export_dir}",
+        "BC_SCOPE": "${user_config.scope}",
+        "BC_API_BASE": "${user_config.api_base}"
+      }
+    }
+  },
+  "user_config": {
+    "tenant_id": {
+      "type": "string",
+      "title": "Entra tenant ID",
+      "description": "The GUID of the Microsoft Entra tenant your Business Central lives in. Find it in the Entra admin center under Overview.",
+      "required": true
+    },
+    "auth_mode": {
+      "type": "string",
+      "title": "Sign-in method",
+      "description": "interactive opens a browser and signs you in as yourself (recommended). service-principal is non-interactive and needs the client ID and secret below. cli and azure-powershell reuse an existing az login or Connect-AzAccount session and require those tools installed.",
+      "default": "interactive",
+      "required": false
+    },
+    "mode": {
+      "type": "string",
+      "title": "Server mode",
+      "description": "read exposes only the query tools. write also exposes create, update, bound actions, and file export, which change real ERP data.",
+      "default": "read",
+      "required": false
+    },
+    "allow_delete": {
+      "type": "boolean",
+      "title": "Allow record deletion",
+      "description": "Exposes delete_entity, which permanently removes records. Requires write mode and is ignored without it. Deletion is always two-step: a dry run returns what would be removed plus a confirmation token.",
+      "default": false,
+      "required": false
+    },
+    "environment": {
+      "type": "string",
+      "title": "Default environment",
+      "description": "Optional. Environment used when a tool call omits one, for example Production or a sandbox name. Leave blank to pass it explicitly every time.",
+      "default": "",
+      "required": false
+    },
+    "company_id": {
+      "type": "string",
+      "title": "Default company ID",
+      "description": "Optional. Company GUID used when a tool call omits one. Discover it with the list_companies tool.",
+      "default": "",
+      "required": false
+    },
+    "export_dir": {
+      "type": "directory",
+      "title": "Export folder",
+      "description": "Where export_file saves invoice PDFs, attachments, and pictures. Prefilled with your Documents folder; confirm or pick another.",
+      "default": "${DOCUMENTS}",
+      "required": true
+    },
+    "client_id": {
+      "type": "string",
+      "title": "Application (client) ID",
+      "description": "Required only for service-principal sign-in. Leave blank for interactive, which falls back to the public Azure CLI client.",
+      "default": "",
+      "required": false
+    },
+    "client_secret": {
+      "type": "string",
+      "title": "Client secret",
+      "description": "Required only for service-principal sign-in. Stored by the operating system's credential manager.",
+      "sensitive": true,
+      "default": "",
+      "required": false
+    },
+    "scope": {
+      "type": "string",
+      "title": "Token scope (advanced)",
+      "description": "Leave blank unless you are on a sovereign cloud. Defaults to https://api.businesscentral.dynamics.com/.default",
+      "default": "",
+      "required": false
+    },
+    "api_base": {
+      "type": "string",
+      "title": "API base URL (advanced)",
+      "description": "Leave blank unless you are on a sovereign cloud or an embedded ISV deployment. Defaults to https://api.businesscentral.dynamics.com",
+      "default": "",
+      "required": false
+    }
+  },
+  "tools": [
+    {
+      "name": "list_environments",
+      "description": "List the production and sandbox environments in the tenant"
+    },
+    {
+      "name": "list_companies",
+      "description": "List the companies in an environment"
+    },
+    {
+      "name": "list_entity_sets",
+      "description": "List the entity sets available on an API route"
+    },
+    {
+      "name": "query_entities",
+      "description": "Query an entity set with OData filter, select, orderby, and expand"
+    },
+    {
+      "name": "get_entity",
+      "description": "Get a single record by id, including its etag"
+    },
+    {
+      "name": "export_file",
+      "description": "Save a Business Central document, attachment, or picture to a local file"
+    },
+    {
+      "name": "create_entity",
+      "description": "Create a record. Changes real ERP data"
+    },
+    {
+      "name": "update_entity",
+      "description": "Update a record with etag concurrency. Changes real ERP data"
+    },
+    {
+      "name": "invoke_bound_action",
+      "description": "Invoke a bound action such as posting a document. Changes real ERP data"
+    },
+    {
+      "name": "delete_entity",
+      "description": "Permanently delete a record, behind a two-step confirmation"
+    }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  }
+}

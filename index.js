@@ -32,6 +32,23 @@ const AUTH_MODES = [
 // Public Azure CLI client ID — safe default for user-flow modes only.
 const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
+// Reads an environment variable, treating blank and unsubstituted values as
+// unset. MCPB clients build the child environment by string-replacing
+// `${user_config.<key>}` in the manifest; an optional field the user left
+// blank only resolves when the manifest gives it a `default`, and otherwise
+// the literal placeholder is passed through verbatim. A literal is truthy, so
+// without this guard `AZURE_CLIENT_ID` would defeat the Azure CLI client-id
+// fallback below and interactive sign-in would fail against Entra with an
+// unhelpful error. The manifest sets defaults on every optional field; this
+// keeps the server correct under clients that resolve them differently.
+function env(name) {
+  const value = process.env[name];
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || /^\$\{[^}]*\}$/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
 function requireEnv(value, name, mode) {
   if (!value) {
     console.error(`BC_AUTH_MODE=${mode} requires ${name}`);
@@ -41,14 +58,14 @@ function requireEnv(value, name, mode) {
 }
 
 function buildCredential() {
-  const mode = (process.env.BC_AUTH_MODE || "interactive").toLowerCase();
+  const mode = (env("BC_AUTH_MODE") || "interactive").toLowerCase();
   if (!AUTH_MODES.includes(mode)) {
     console.error(`Invalid BC_AUTH_MODE "${mode}". Valid: ${AUTH_MODES.join(", ")}`);
     process.exit(1);
   }
-  const tenantId = process.env.AZURE_TENANT_ID;
-  const clientId = process.env.AZURE_CLIENT_ID;
-  const clientSecret = process.env.AZURE_CLIENT_SECRET;
+  const tenantId = env("AZURE_TENANT_ID");
+  const clientId = env("AZURE_CLIENT_ID");
+  const clientSecret = env("AZURE_CLIENT_SECRET");
 
   switch (mode) {
     case "interactive":
@@ -88,10 +105,10 @@ const credential = buildCredential();
 // Business Central Online. One host serves everything: the environment
 // discovery API at /environments/v1.1 and the per-environment data plane at
 // /v2.0/{environment}/api/{route}/... . Token audience is the same host.
-const SCOPE = process.env.BC_SCOPE || "https://api.businesscentral.dynamics.com/.default";
-const BC_BASE = process.env.BC_API_BASE || "https://api.businesscentral.dynamics.com";
-const DEFAULT_ENVIRONMENT = process.env.BC_DEFAULT_ENVIRONMENT || null;
-const DEFAULT_COMPANY_ID = process.env.BC_DEFAULT_COMPANY_ID || null;
+const SCOPE = env("BC_SCOPE") || "https://api.businesscentral.dynamics.com/.default";
+const BC_BASE = env("BC_API_BASE") || "https://api.businesscentral.dynamics.com";
+const DEFAULT_ENVIRONMENT = env("BC_DEFAULT_ENVIRONMENT") || null;
+const DEFAULT_COMPANY_ID = env("BC_DEFAULT_COMPANY_ID") || null;
 const MAX_RETRIES = 3;
 const RETRY_MAX_DELAY_MS = 60_000;
 // Ceiling for export_file downloads. BC attachments are user-uploaded and
@@ -381,7 +398,7 @@ function resolveExportTarget({
     ? safeFileName(suggested)
     : `${safeFileName(entity_set)}_${safeFileName(record_id)}_${safeFileName(leaf)}${sniffExtension(buffer, contentType)}`;
   if (!output_path) {
-    return resolve(process.env.BC_EXPORT_DIR || process.cwd(), name);
+    return resolve(env("BC_EXPORT_DIR") || process.cwd(), name);
   }
   const candidate = resolve(output_path);
   const isDirectory =
@@ -486,8 +503,8 @@ function writeTool(toolName, getTarget, handler) {
   });
 }
 
-const WRITE_ENABLED = (process.env.BC_MCP_MODE ?? "read").toLowerCase() === "write";
-const DESTRUCTIVE_REQUESTED = process.env.BC_MCP_ALLOW_DELETE === "true";
+const WRITE_ENABLED = (env("BC_MCP_MODE") ?? "read").toLowerCase() === "write";
+const DESTRUCTIVE_REQUESTED = env("BC_MCP_ALLOW_DELETE") === "true";
 const DESTRUCTIVE_ENABLED = WRITE_ENABLED && DESTRUCTIVE_REQUESTED;
 if (WRITE_ENABLED) {
   console.error(
