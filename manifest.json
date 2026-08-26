@@ -35,6 +35,7 @@
         "BC_DEFAULT_ENVIRONMENT": "${user_config.environment}",
         "BC_DEFAULT_COMPANY_ID": "${user_config.company_id}",
         "BC_EXPORT_DIR": "${user_config.export_dir}",
+        "BC_ITEM_ATTR_API_ROUTE": "${user_config.item_attr_api_route}",
         "BC_SCOPE": "${user_config.scope}",
         "BC_API_BASE": "${user_config.api_base}"
       }
@@ -87,6 +88,13 @@
       "title": "Export folder",
       "description": "Where export_file saves invoice PDFs, attachments, and pictures. Pick a folder you can write to.",
       "required": true
+    },
+    "item_attr_api_route": {
+      "type": "string",
+      "title": "Item attribute API route",
+      "description": "Optional. Custom AL API route (publisher/group/version) that publishes itemAttributes, itemAttributeValues, and itemAttributeValueMappings, used by set_item_attribute when a call omits api_route. The standard v2.0 API does not expose item attributes.",
+      "default": "",
+      "required": false
     },
     "client_id": {
       "type": "string",
@@ -150,6 +158,10 @@
     {
       "name": "update_entity",
       "description": "Update a record with etag concurrency. Changes real ERP data"
+    },
+    {
+      "name": "set_item_attribute",
+      "description": "Set an item attribute by name and value, two-step plan/apply. Changes real ERP data"
     },
     {
       "name": "invoke_bound_action",

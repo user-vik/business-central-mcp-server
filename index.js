@@ -443,6 +443,127 @@ function resolveExportTarget({
   return isDirectory ? resolve(candidate, name) : candidate;
 }
 
+// ─── Item attribute helpers ─────────────────────────────────────────────────
+// Item attributes are not fields on the item card. Each assignment is a row in
+// the Item Attribute Value Mapping table (7505) — keyed by table id + item no +
+// attribute id — pointing at an option row in Item Attribute Value (7501),
+// which belongs to a definition in Item Attribute (7500). None of these tables
+// are exposed on Microsoft's standard v2.0 API, so set_item_attribute needs a
+// custom AL API route that publishes them as itemAttributes,
+// itemAttributeValues, and itemAttributeValueMappings with AL-style field
+// names (name/type on 7500; attributeID/id/value on 7501;
+// tableID/no/itemAttributeID/itemAttributeValueID on 7505).
+
+const ITEM_ATTRIBUTE_TABLE_ID = 27; // table 27 = Item
+
+// OData string literal: single quotes double up.
+function odataString(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function resolveItemAttributeRoute(api_route) {
+  const route = resolveRoute(api_route || env("BC_ITEM_ATTR_API_ROUTE"));
+  if (route === "v2.0") {
+    throw new Error(
+      "Item attributes are not exposed on the standard v2.0 API. Pass api_route (or set BC_ITEM_ATTR_API_ROUTE) to a custom AL API that publishes itemAttributes, itemAttributeValues, and itemAttributeValueMappings.",
+    );
+  }
+  return route;
+}
+
+async function queryEntitySet(env, route, companyId, entitySet, query) {
+  const data = await bcApi(
+    "GET",
+    companyPath(env, route, companyId, `/${encodeURIComponent(entitySet)}`),
+    undefined,
+    query,
+  );
+  return data.value ?? [];
+}
+
+// Match an input string against candidate rows: exact first, then
+// case-insensitive. One winner returns; anything else throws through the
+// callbacks so each caller words its own error.
+function matchOne(rows, field, input, { onAmbiguous, onMissing }) {
+  const wanted = String(input).trim();
+  const exact = rows.filter((r) => String(r[field] ?? "").trim() === wanted);
+  if (exact.length === 1) return exact[0];
+  const ci = rows.filter(
+    (r) =>
+      String(r[field] ?? "")
+        .trim()
+        .toLowerCase() === wanted.toLowerCase(),
+  );
+  if (ci.length === 1) return ci[0];
+  if (ci.length > 1 || exact.length > 1) throw onAmbiguous(exact.length > 1 ? exact : ci);
+  throw onMissing();
+}
+
+async function resolveItemAttribute(env, route, companyId, attributeName) {
+  const rows = await queryEntitySet(env, route, companyId, "itemAttributes", { $top: 1000 });
+  return matchOne(rows, "name", attributeName, {
+    onAmbiguous: (matches) =>
+      new Error(
+        `"${attributeName}" matches ${matches.length} attributes: ${matches.map((r) => `"${r.name}" (id ${r.id})`).join(", ")}. Repeat with the exact name.`,
+      ),
+    onMissing: () => {
+      const names = rows.map((r) => String(r.name ?? "")).filter(Boolean);
+      const near = names.filter((n) =>
+        n.toLowerCase().includes(String(attributeName).trim().toLowerCase()),
+      );
+      return new Error(
+        `No item attribute named "${attributeName}". ` +
+          (near.length
+            ? `Close matches: ${near.join(", ")}.`
+            : `Known attributes: ${names.join(", ")}.`),
+      );
+    },
+  });
+}
+
+async function resolveItemAttributeOption(env, route, companyId, attribute, value) {
+  const options = await queryEntitySet(env, route, companyId, "itemAttributeValues", {
+    $filter: `attributeID eq ${Number(attribute.id)}`,
+    $top: 1000,
+  });
+  const option = matchOne(options, "value", value, {
+    onAmbiguous: (matches) =>
+      new Error(
+        `"${value}" is ambiguous for attribute "${attribute.name}": ${matches.map((r) => `"${r.value}" (id ${r.id})`).join(", ")}. Repeat with the exact casing.`,
+      ),
+    onMissing: () =>
+      new Error(
+        `"${value}" is not an option for attribute "${attribute.name}". Valid options: ${options
+          .map((r) => String(r.value ?? ""))
+          .filter(Boolean)
+          .join(
+            " | ",
+          )}. This tool never creates new options — add it in BC first if it should exist.`,
+      ),
+  });
+  return { option, options };
+}
+
+// Best-effort item existence check. Custom APIs name the item key per their AL
+// page ("no" is conventional; standard v2.0 uses "number"), and some routes
+// don't publish items at all — those degrade to null ("unchecked") rather than
+// blocking, since BC validates the mapping's table relation on write anyway.
+async function checkItemExists(env, route, companyId, itemNo) {
+  for (const field of ["no", "number"]) {
+    try {
+      const rows = await queryEntitySet(env, route, companyId, "items", {
+        $filter: `${field} eq ${odataString(itemNo)}`,
+        $select: field,
+        $top: 1,
+      });
+      return rows.length > 0;
+    } catch {
+      // Wrong key field name or items not published on this route; try next.
+    }
+  }
+  return null;
+}
+
 // GET a resource and return null on 404 instead of throwing. Used by the
 // destructive tools' plan step to detect existence before delete.
 async function fetchExistingOrNull(path) {
@@ -696,6 +817,16 @@ const routeInput = z
   .describe(
     'API route under /api/. Defaults to the standard "v2.0"; pass "{publisher}/{group}/{version}" for a custom AL API.',
   );
+const planApplyInputs = {
+  dry_run: z
+    .boolean()
+    .optional()
+    .describe("If true (default), return the planned change without applying."),
+  confirm_token: z
+    .string()
+    .optional()
+    .describe("Token returned by a recent dry_run. Required when dry_run=false."),
+};
 
 const server = new McpServer({ name: "business-central-mcp", version: VERSION });
 
@@ -1062,6 +1193,169 @@ if (WRITE_ENABLED) {
   );
 
   server.registerTool(
+    "set_item_attribute",
+    {
+      description:
+        "Set an item attribute on an item: resolves the attribute by name, validates the value against the attribute's option list, and updates (or creates) the item's mapping row. Requires a custom AL API route that publishes itemAttributes, itemAttributeValues, and itemAttributeValueMappings — the standard v2.0 API does not expose them; pass api_route or set BC_ITEM_ATTR_API_ROUTE. Two-step: the first call (dry_run=true, default) returns current value → new value with resolved ids plus a confirm_token; a second call with dry_run=false and that token applies it and re-reads the row to verify. Only Option-type attributes are supported, and a value missing from the option list is an error — this tool never creates new dropdown options. WRITE OPERATION: modifies real ERP item master data.",
+      inputSchema: {
+        item_no: z.string().describe("The item's No. (e.g. '90031') — not its GUID"),
+        attribute_name: z
+          .string()
+          .describe("Item attribute name exactly as defined in BC, e.g. 'Group Name'"),
+        value: z
+          .string()
+          .describe(
+            "Target option value, e.g. 'Roll'. Matched exactly first, then case-insensitively, against the attribute's option list.",
+          ),
+        environment: envInput,
+        company_id: companyInput,
+        api_route: z
+          .string()
+          .optional()
+          .describe(
+            'Custom AL API route publishing the item-attribute entity sets, "{publisher}/{group}/{version}". Falls back to BC_ITEM_ATTR_API_ROUTE.',
+          ),
+        ...planApplyInputs,
+      },
+    },
+    writeTool(
+      "set_item_attribute",
+      ({ item_no, attribute_name, value, environment, company_id }) =>
+        `env=${environment || DEFAULT_ENVIRONMENT || "?"} company=${company_id || DEFAULT_COMPANY_ID || "?"} item=${item_no} attribute=${attribute_name} value=${value}`,
+      async ({
+        item_no,
+        attribute_name,
+        value,
+        environment,
+        company_id,
+        api_route,
+        dry_run,
+        confirm_token,
+      }) => {
+        const env = resolveEnv(environment);
+        const route = resolveItemAttributeRoute(api_route);
+        const companyId = resolveCompany(company_id);
+
+        const attribute = await resolveItemAttribute(env, route, companyId, attribute_name);
+        if (String(attribute.type) !== "Option") {
+          throw new Error(
+            `Attribute "${attribute.name}" is type ${attribute.type}; only Option-type attributes are supported.`,
+          );
+        }
+        if (attribute.blocked) {
+          throw new Error(`Attribute "${attribute.name}" is blocked in BC.`);
+        }
+        const { option, options } = await resolveItemAttributeOption(
+          env,
+          route,
+          companyId,
+          attribute,
+          value,
+        );
+        if (option.blocked) {
+          throw new Error(`Option "${option.value}" (id ${option.id}) is blocked in BC.`);
+        }
+
+        const itemExists = await checkItemExists(env, route, companyId, item_no);
+        if (itemExists === false) {
+          throw new Error(`Item ${item_no} does not exist in this company.`);
+        }
+
+        const mappingFilter = `tableID eq ${ITEM_ATTRIBUTE_TABLE_ID} and no eq ${odataString(item_no)} and itemAttributeID eq ${Number(attribute.id)}`;
+        const mappings = await queryEntitySet(env, route, companyId, "itemAttributeValueMappings", {
+          $filter: mappingFilter,
+          $top: 2,
+        });
+        if (mappings.length > 1) {
+          throw new Error(
+            `Found ${mappings.length} mapping rows for item ${item_no} / attribute "${attribute.name}"; expected at most one. Inspect itemAttributeValueMappings manually.`,
+          );
+        }
+        const current = mappings[0] ?? null;
+        const currentOption = current
+          ? (options.find((o) => o.id === current.itemAttributeValueID) ?? null)
+          : null;
+
+        const summary = {
+          item_no,
+          attribute: { id: attribute.id, name: attribute.name },
+          current_value: current
+            ? {
+                id: current.itemAttributeValueID,
+                value: currentOption?.value ?? "(unknown option)",
+              }
+            : null,
+          new_value: { id: option.id, value: option.value },
+          item_checked: itemExists ?? "items not queryable on this route; existence not verified",
+        };
+
+        if (current && current.itemAttributeValueID === option.id) {
+          return ok({
+            already_set: true,
+            ...summary,
+            hint: "No write performed — the mapping already points at this option.",
+          });
+        }
+
+        const target = `env=${env} company=${companyId} item=${item_no} attribute=${attribute.id} value=${option.id}`;
+        // Recomputed on both the plan and apply calls; a mismatch (e.g. the
+        // mapping row appeared or vanished in between) invalidates the token.
+        const payload = {
+          env,
+          companyId,
+          route,
+          item_no,
+          attributeId: attribute.id,
+          optionId: option.id,
+          mappingSystemId: current?.systemId ?? null,
+        };
+
+        return executePlanApply({
+          toolName: "set_item_attribute",
+          action: current ? "update item attribute mapping" : "create item attribute mapping",
+          target,
+          payload,
+          dry_run,
+          confirm_token,
+          fetchBefore: async () => (current ? { ...current, _resolved: summary } : null),
+          buildAfter: () => summary,
+          apply: async (etag) => {
+            let written;
+            if (current) {
+              written = await bcApi(
+                "PATCH",
+                entityPath(env, route, companyId, "itemAttributeValueMappings", current.systemId),
+                { itemAttributeValueID: option.id },
+                undefined,
+                { "If-Match": etag ?? current["@odata.etag"] },
+              );
+            } else {
+              written = await bcApi(
+                "POST",
+                companyPath(env, route, companyId, "/itemAttributeValueMappings"),
+                {
+                  tableID: ITEM_ATTRIBUTE_TABLE_ID,
+                  no: item_no,
+                  itemAttributeID: attribute.id,
+                  itemAttributeValueID: option.id,
+                },
+              );
+            }
+            const verify = await queryEntitySet(
+              env,
+              route,
+              companyId,
+              "itemAttributeValueMappings",
+              { $filter: mappingFilter, $top: 1 },
+            );
+            return { ...summary, written: written ?? null, verified: verify[0] ?? null };
+          },
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
     "invoke_bound_action",
     {
       description:
@@ -1109,17 +1403,6 @@ if (WRITE_ENABLED) {
 // token and uses If-Match for optimistic concurrency.
 
 if (DESTRUCTIVE_ENABLED) {
-  const planApplyInputs = {
-    dry_run: z
-      .boolean()
-      .optional()
-      .describe("If true (default), return the planned change without applying."),
-    confirm_token: z
-      .string()
-      .optional()
-      .describe("Token returned by a recent dry_run. Required when dry_run=false."),
-  };
-
   server.registerTool(
     "delete_entity",
     {

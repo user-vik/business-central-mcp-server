@@ -42,6 +42,7 @@ const WRITE_TOOLS = [
   "create_entity",
   "export_file",
   "invoke_bound_action",
+  "set_item_attribute",
   "update_entity",
 ];
 
