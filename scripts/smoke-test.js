@@ -79,6 +79,7 @@ function listTools(overrides) {
     });
 
     child.on("error", (error) => finish(error));
+    child.stdin.on("error", (error) => finish(error));
     child.on("exit", (code) => {
       if (code !== 0 && code !== null) {
         finish(new Error(`server exited with code ${code}\n${stderr}`));
