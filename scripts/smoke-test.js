@@ -7,23 +7,27 @@
 // spawn the real entry point, complete the handshake, and compare
 // `tools/list` against the modes documented in `.env.example`.
 
-import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { listTools, runUntilExit } from "./lib/stdio-client.js";
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = resolve(ROOT, "index.js");
-const TIMEOUT_MS = 30_000;
 
-// Fake service-principal credentials keep startup non-interactive and offline.
-// @azure/identity does not contact Entra until a token is actually requested,
-// and the handshake never requests one.
+// Throwaway service-principal credentials keep startup non-interactive and
+// offline. @azure/identity does not contact Entra until a token is actually
+// requested, and the handshake never requests one.
 const BASE_ENV = {
   BC_AUTH_MODE: "service-principal",
   AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000",
   AZURE_CLIENT_ID: "smoke-test",
   AZURE_CLIENT_SECRET: "smoke-test",
 };
+
+// Mirrors AZURE_CLI_CLIENT_ID in index.js. Interactive sign-in falls back to
+// this public client when no client id is configured.
+const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
 const READ_TOOLS = [
   "get_entity",
@@ -43,90 +47,6 @@ const WRITE_TOOLS = [
 
 const DESTRUCTIVE_TOOLS = [...WRITE_TOOLS, "delete_entity"];
 
-// A developer's own BC_*/AZURE_* exports must not leak into the child, or the
-// assertions below would pass or fail based on their local shell.
-function cleanEnv(overrides) {
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (!key.startsWith("BC_") && !key.startsWith("AZURE_")) env[key] = value;
-  }
-  return { ...env, ...BASE_ENV, ...overrides };
-}
-
-function listTools(overrides) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [ENTRY], {
-      env: cleanEnv(overrides),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill();
-      rejectPromise(new Error(`timed out after ${TIMEOUT_MS}ms\n${stderr}`));
-    }, TIMEOUT_MS);
-
-    const finish = (error, value) => {
-      clearTimeout(timer);
-      child.kill();
-      if (error) rejectPromise(error);
-      else resolvePromise(value);
-    };
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-
-    child.on("error", (error) => finish(error));
-    child.stdin.on("error", (error) => finish(error));
-    child.on("exit", (code) => {
-      if (code !== 0 && code !== null) {
-        finish(new Error(`server exited with code ${code}\n${stderr}`));
-      }
-    });
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      // The stdio transport is newline-delimited JSON; the last element is a
-      // partial line until the next chunk arrives.
-      const lines = stdout.split("\n");
-      stdout = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let message;
-        try {
-          message = JSON.parse(line);
-        } catch {
-          finish(new Error(`non-JSON line on stdout: ${line}`));
-          return;
-        }
-        if (message.id === 2) {
-          if (message.error) {
-            finish(new Error(`tools/list failed: ${JSON.stringify(message.error)}`));
-            return;
-          }
-          finish(null, message.result.tools.map((tool) => tool.name).sort());
-        }
-      }
-    });
-
-    const send = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
-    send({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "smoke-test", version: "1.0.0" },
-      },
-    });
-    send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-  });
-}
-
 const CASES = [
   { name: "read mode (default)", env: {}, expected: READ_TOOLS },
   { name: "write mode", env: { BC_MCP_MODE: "write" }, expected: WRITE_TOOLS },
@@ -141,20 +61,96 @@ const CASES = [
     env: { BC_MCP_ALLOW_DELETE: "true" },
     expected: READ_TOOLS,
   },
+  {
+    // An MCPB client passes `${user_config.<key>}` through verbatim when an
+    // optional field is blank and the manifest gives it no default.
+    //
+    // Asserting the tool surface alone would not catch a regression here:
+    // tools/list never requests a token, so a credential built with the literal
+    // as its client id still lists five tools. The stderr assertions are what
+    // make this bite.
+    name: "interactive survives unsubstituted placeholders",
+    env: {
+      BC_AUTH_MODE: "interactive",
+      AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000",
+      AZURE_CLIENT_ID: "${user_config.client_id}",
+      AZURE_CLIENT_SECRET: "${user_config.client_secret}",
+    },
+    expected: READ_TOOLS,
+    expectStderr: [
+      new RegExp(`interactive sign-in as client ${AZURE_CLI_CLIENT_ID}`),
+      /interactive sign-in as client .*public Azure CLI client/,
+      /ignoring unsubstituted configuration:.*AZURE_CLIENT_ID/,
+      /ignoring unsubstituted configuration:.*AZURE_CLIENT_SECRET/,
+    ],
+  },
+  {
+    // The counterpart: a real client id must be used verbatim, so the case
+    // above is proving a fallback rather than a constant.
+    name: "interactive honours an explicit client id",
+    env: {
+      BC_AUTH_MODE: "interactive",
+      AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000",
+      AZURE_CLIENT_ID: "11111111-2222-3333-4444-555555555555",
+    },
+    expected: READ_TOOLS,
+    expectStderr: [/interactive sign-in as client 11111111-2222-3333-4444-555555555555$/m],
+    rejectStderr: [/public Azure CLI client/],
+  },
+];
+
+// The placeholder guard is only meaningful if an unsubstituted value reads as
+// *unset*. Without it the literal is truthy, requireEnv is satisfied, and the
+// server boots with a garbage tenant that only fails later at the Entra
+// round-trip, where the error says nothing about the real cause.
+const REFUSAL_CASES = [
+  {
+    name: "placeholder tenant refuses to start",
+    env: { BC_AUTH_MODE: "interactive", AZURE_TENANT_ID: "${user_config.tenant_id}" },
+    expectStderr: /requires AZURE_TENANT_ID/,
+  },
+  {
+    name: "blank tenant refuses to start",
+    env: { BC_AUTH_MODE: "interactive", AZURE_TENANT_ID: "" },
+    expectStderr: /requires AZURE_TENANT_ID/,
+  },
+  {
+    // BC_MCP_MODE arrives as free text from the install dialog, because the
+    // manifest schema has no enum for string fields. A typo used to degrade
+    // silently to read mode, leaving the user hunting for absent tools.
+    name: "unrecognised BC_MCP_MODE refuses to start",
+    env: { BC_MCP_MODE: "readwrite" },
+    expectStderr: /Invalid BC_MCP_MODE "readwrite"/,
+  },
 ];
 
 let failed = 0;
+
 for (const testCase of CASES) {
   try {
-    const actual = await listTools(testCase.env);
+    const { tools, stderr } = await listTools({
+      args: [ENTRY],
+      env: { ...BASE_ENV, ...testCase.env },
+    });
     const expected = [...testCase.expected].sort();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    const problems = [];
+    if (JSON.stringify(tools) !== JSON.stringify(expected)) {
+      problems.push(`expected tools: ${expected.join(", ")}`);
+      problems.push(`actual tools:   ${tools.join(", ")}`);
+    }
+    for (const pattern of testCase.expectStderr ?? []) {
+      if (!pattern.test(stderr)) problems.push(`stderr missing ${pattern}`);
+    }
+    for (const pattern of testCase.rejectStderr ?? []) {
+      if (pattern.test(stderr)) problems.push(`stderr unexpectedly matched ${pattern}`);
+    }
+    if (problems.length > 0) {
       console.error(`FAIL  ${testCase.name}`);
-      console.error(`      expected: ${expected.join(", ")}`);
-      console.error(`      actual:   ${actual.join(", ")}`);
+      for (const problem of problems) console.error(`      ${problem}`);
+      if (stderr.trim()) console.error(`      stderr: ${stderr.trim()}`);
       failed += 1;
     } else {
-      console.log(`ok    ${testCase.name} (${actual.length} tools)`);
+      console.log(`ok    ${testCase.name} (${tools.length} tools)`);
     }
   } catch (error) {
     console.error(`FAIL  ${testCase.name}: ${error.message}`);
@@ -162,8 +158,31 @@ for (const testCase of CASES) {
   }
 }
 
+for (const testCase of REFUSAL_CASES) {
+  try {
+    const { code, stderr } = await runUntilExit({
+      args: [ENTRY],
+      env: { ...BASE_ENV, ...testCase.env },
+    });
+    if (code === 0) {
+      console.error(`FAIL  ${testCase.name}: exited 0, expected a non-zero exit`);
+      failed += 1;
+    } else if (!testCase.expectStderr.test(stderr)) {
+      console.error(`FAIL  ${testCase.name}: stderr did not match ${testCase.expectStderr}`);
+      console.error(`      stderr: ${stderr.trim()}`);
+      failed += 1;
+    } else {
+      console.log(`ok    ${testCase.name} (exit ${code})`);
+    }
+  } catch (error) {
+    console.error(`FAIL  ${testCase.name}: ${error.message}`);
+    failed += 1;
+  }
+}
+
+const total = CASES.length + REFUSAL_CASES.length;
 if (failed > 0) {
-  console.error(`\n${failed} of ${CASES.length} smoke tests failed`);
+  console.error(`\n${failed} of ${total} smoke tests failed`);
   process.exit(1);
 }
-console.log(`\nall ${CASES.length} smoke tests passed`);
+console.log(`\nall ${total} smoke tests passed`);

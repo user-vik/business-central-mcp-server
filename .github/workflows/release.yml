@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      # A tag that disagrees with package.json would publish a bundle whose
+      # manifest version does not match its filename.
+      - name: Check tag against package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            exit 1
+          fi
+          echo "releasing $pkg"
+
+      - run: npm run check
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+
+      - run: npm run build:mcpb
+      - run: npm run verify:mcpb
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          notes=$(mktemp)
+          {
+            echo "Download the \`.mcpb\` below and open it with Claude Desktop."
+            echo
+            echo "See [CHANGELOG.md](https://github.com/$REPO/blob/$GITHUB_REF_NAME/CHANGELOG.md) for what changed."
+          } > "$notes"
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$notes" dist/*.mcpb

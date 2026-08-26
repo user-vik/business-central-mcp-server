@@ -32,6 +32,54 @@ const AUTH_MODES = [
 // Public Azure CLI client ID — safe default for user-flow modes only.
 const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
+// An MCPB client builds the child environment by string-replacing
+// `${user_config.<key>}` in the manifest. An optional field the user left
+// blank only resolves when the manifest declares a `default` for it, and
+// otherwise the literal placeholder is passed through verbatim.
+const PLACEHOLDER = /^\$\{[^}]*\}$/;
+
+// Deletes blank and unsubstituted BC_*/AZURE_* entries from the environment
+// before anything reads them.
+//
+// Guarding this module's own reads is not enough: @azure/identity reads
+// AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET straight off
+// process.env in EnvironmentCredential, which DefaultAzureCredential
+// (BC_AUTH_MODE=default) chains into. Three surviving placeholders look like a
+// complete service principal to it, and it would attempt a client-secret flow
+// with literal `${...}` strings. Scrubbing the environment once, rather than
+// filtering at each read site, closes that for every consumer in the process.
+function sanitizeEnvironment() {
+  const discarded = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^(?:BC_|AZURE_)/.test(key)) continue;
+    const trimmed = (value ?? "").trim();
+    if (!trimmed) {
+      delete process.env[key];
+    } else if (PLACEHOLDER.test(trimmed)) {
+      delete process.env[key];
+      discarded.push(key);
+    }
+  }
+  if (discarded.length > 0) {
+    // Worth saying out loud: it means a manifest is missing a default, and the
+    // symptom otherwise shows up much later as a confusing auth failure.
+    console.error(
+      `[bc-mcp] ignoring unsubstituted configuration: ${discarded.join(", ")}. ` +
+        "Treating these as unset.",
+    );
+  }
+}
+
+sanitizeEnvironment();
+
+// Reads an environment variable, treating blank as unset. Placeholders are
+// already gone by the time anything calls this.
+function env(name) {
+  const value = process.env[name];
+  if (!value) return undefined;
+  return value.trim() || undefined;
+}
+
 function requireEnv(value, name, mode) {
   if (!value) {
     console.error(`BC_AUTH_MODE=${mode} requires ${name}`);
@@ -41,21 +89,27 @@ function requireEnv(value, name, mode) {
 }
 
 function buildCredential() {
-  const mode = (process.env.BC_AUTH_MODE || "interactive").toLowerCase();
+  const mode = (env("BC_AUTH_MODE") || "interactive").toLowerCase();
   if (!AUTH_MODES.includes(mode)) {
     console.error(`Invalid BC_AUTH_MODE "${mode}". Valid: ${AUTH_MODES.join(", ")}`);
     process.exit(1);
   }
-  const tenantId = process.env.AZURE_TENANT_ID;
-  const clientId = process.env.AZURE_CLIENT_ID;
-  const clientSecret = process.env.AZURE_CLIENT_SECRET;
+  const tenantId = env("AZURE_TENANT_ID");
+  const clientId = env("AZURE_CLIENT_ID");
+  const clientSecret = env("AZURE_CLIENT_SECRET");
 
   switch (mode) {
-    case "interactive":
+    case "interactive": {
+      const effectiveClientId = clientId || AZURE_CLI_CLIENT_ID;
+      console.error(
+        `[bc-mcp] interactive sign-in as client ${effectiveClientId}` +
+          (clientId ? "" : " (public Azure CLI client)"),
+      );
       return new InteractiveBrowserCredential({
         tenantId: requireEnv(tenantId, "AZURE_TENANT_ID", mode),
-        clientId: clientId || AZURE_CLI_CLIENT_ID,
+        clientId: effectiveClientId,
       });
+    }
     case "device-code":
       return new DeviceCodeCredential({
         tenantId: requireEnv(tenantId, "AZURE_TENANT_ID", mode),
@@ -88,10 +142,10 @@ const credential = buildCredential();
 // Business Central Online. One host serves everything: the environment
 // discovery API at /environments/v1.1 and the per-environment data plane at
 // /v2.0/{environment}/api/{route}/... . Token audience is the same host.
-const SCOPE = process.env.BC_SCOPE || "https://api.businesscentral.dynamics.com/.default";
-const BC_BASE = process.env.BC_API_BASE || "https://api.businesscentral.dynamics.com";
-const DEFAULT_ENVIRONMENT = process.env.BC_DEFAULT_ENVIRONMENT || null;
-const DEFAULT_COMPANY_ID = process.env.BC_DEFAULT_COMPANY_ID || null;
+const SCOPE = env("BC_SCOPE") || "https://api.businesscentral.dynamics.com/.default";
+const BC_BASE = env("BC_API_BASE") || "https://api.businesscentral.dynamics.com";
+const DEFAULT_ENVIRONMENT = env("BC_DEFAULT_ENVIRONMENT") || null;
+const DEFAULT_COMPANY_ID = env("BC_DEFAULT_COMPANY_ID") || null;
 const MAX_RETRIES = 3;
 const RETRY_MAX_DELAY_MS = 60_000;
 // Ceiling for export_file downloads. BC attachments are user-uploaded and
@@ -381,7 +435,7 @@ function resolveExportTarget({
     ? safeFileName(suggested)
     : `${safeFileName(entity_set)}_${safeFileName(record_id)}_${safeFileName(leaf)}${sniffExtension(buffer, contentType)}`;
   if (!output_path) {
-    return resolve(process.env.BC_EXPORT_DIR || process.cwd(), name);
+    return resolve(env("BC_EXPORT_DIR") || process.cwd(), name);
   }
   const candidate = resolve(output_path);
   const isDirectory =
@@ -486,8 +540,16 @@ function writeTool(toolName, getTarget, handler) {
   });
 }
 
-const WRITE_ENABLED = (process.env.BC_MCP_MODE ?? "read").toLowerCase() === "write";
-const DESTRUCTIVE_REQUESTED = process.env.BC_MCP_ALLOW_DELETE === "true";
+const SERVER_MODE = (env("BC_MCP_MODE") ?? "read").toLowerCase();
+if (SERVER_MODE !== "read" && SERVER_MODE !== "write") {
+  // Matches how BC_AUTH_MODE handles an unknown value. Failing quietly into
+  // read mode leaves the user hunting for tools that were never registered,
+  // and a stderr warning is invisible in a desktop client.
+  console.error(`Invalid BC_MCP_MODE "${SERVER_MODE}". Valid: read, write`);
+  process.exit(1);
+}
+const WRITE_ENABLED = SERVER_MODE === "write";
+const DESTRUCTIVE_REQUESTED = env("BC_MCP_ALLOW_DELETE") === "true";
 const DESTRUCTIVE_ENABLED = WRITE_ENABLED && DESTRUCTIVE_REQUESTED;
 if (WRITE_ENABLED) {
   console.error(

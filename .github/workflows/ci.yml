@@ -39,3 +39,35 @@ jobs:
 
       # Boots the real server over stdio and asserts the tool surface per mode.
       - run: npm test
+
+  bundle:
+    # Builds the .mcpb, then unpacks it and boots the server out of the archive
+    # through the same config substitution Claude Desktop performs. Runs on
+    # both platforms because the bundle is cross-platform by construction and
+    # nothing else proves that.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build:mcpb
+
+      - run: npm run verify:mcpb
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: mcpb-bundle
+          path: dist/*.mcpb
+          if-no-files-found: error

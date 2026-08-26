@@ -16,6 +16,6 @@ export default [
     },
   },
   {
-    ignores: ["node_modules/", "package-lock.json"],
+    ignores: ["node_modules/", "dist/", "package-lock.json"],
   },
 ];
