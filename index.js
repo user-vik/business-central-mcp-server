@@ -548,6 +548,10 @@ async function resolveItemAttributeOption(env, route, companyId, attribute, valu
 // page ("no" is conventional; standard v2.0 uses "number"), and some routes
 // don't publish items at all — those degrade to null ("unchecked") rather than
 // blocking, since BC validates the mapping's table relation on write anyway.
+// Only the two expected shapes are swallowed: 400 (unknown key field) and 404
+// (items not published on this route). Auth failures, throttling that outlived
+// the retries, and server errors propagate so they are not mistaken for
+// "unchecked".
 async function checkItemExists(env, route, companyId, itemNo) {
   for (const field of ["no", "number"]) {
     try {
@@ -557,8 +561,9 @@ async function checkItemExists(env, route, companyId, itemNo) {
         $top: 1,
       });
       return rows.length > 0;
-    } catch {
-      // Wrong key field name or items not published on this route; try next.
+    } catch (e) {
+      if (e?.status === 400 || e?.status === 404) continue;
+      throw e;
     }
   }
   return null;
