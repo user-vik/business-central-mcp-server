@@ -71,6 +71,7 @@ const ALL_TOOLS = [
   "delete_entity",
   "export_file",
   "invoke_bound_action",
+  "set_item_attribute",
   "update_entity",
 ];
 

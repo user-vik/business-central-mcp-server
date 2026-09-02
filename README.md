@@ -66,6 +66,7 @@ refused before anything is written.
 | --------------------- | ------------------------------------------------------------------------ |
 | `create_entity`       | Insert a record (customer, item, sales order, ...).                      |
 | `update_entity`       | PATCH fields on a record, `If-Match` etag concurrency handled for you.   |
+| `set_item_attribute`  | Set an item attribute by name/value; two-step dry_run → confirm → apply. |
 | `invoke_bound_action` | Call a bound action — `post`, `ship`, `cancel`, ... (`Microsoft.NAV.*`). |
 | `export_file`         | Download a document (invoice PDF, attachment, picture) to a local file.  |
 
@@ -73,6 +74,32 @@ Every write call is audit-logged to stderr with timestamp, tool, target, and
 caller identity. **These mutate real ERP data** — posting a document creates
 ledger entries that cannot simply be deleted. Point `BC_DEFAULT_ENVIRONMENT`
 at a sandbox while experimenting.
+
+#### Setting item attributes
+
+Item attributes are not fields on the item card: each assignment is a row in
+the Item Attribute Value Mapping table pointing at an option in Item Attribute
+Value. None of those tables are on Microsoft's standard v2.0 API, so
+`set_item_attribute` needs a custom AL API route that publishes them as
+`itemAttributes`, `itemAttributeValues`, and `itemAttributeValueMappings` —
+pass it as `api_route` or set `BC_ITEM_ATTR_API_ROUTE` once.
+
+The tool resolves the attribute name and value against what actually exists
+(exact match first, then case-insensitive; ambiguity is an error, and a value
+missing from the option list is rejected rather than created), then runs as a
+plan/apply pair:
+
+```jsonc
+// 1. Plan (dry_run defaults to true) — returns current → new + confirm_token
+{ "item_no": "90031", "attribute_name": "Group Name", "value": "Roll" }
+
+// 2. Apply — echoes the token, PATCHes (or POSTs) the mapping, re-reads to verify
+{ "item_no": "90031", "attribute_name": "Group Name", "value": "Roll",
+  "dry_run": false, "confirm_token": "<from step 1>" }
+```
+
+Only Option-type attributes are supported. If the mapping already points at
+the requested option the tool reports `already_set` and writes nothing.
 
 ### Destructive (`BC_MCP_MODE=write` **and** `BC_MCP_ALLOW_DELETE=true`)
 
